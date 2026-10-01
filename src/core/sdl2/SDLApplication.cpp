@@ -29,6 +29,9 @@
 #include "StorageIntf.h"
 #include "SDLBitmapCompletion.h"
 #include "ScriptMgnIntf.h"
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+#include "LinuxVideoPlayer.h"
+#endif
 #include "SystemControl.h"
 #include "PluginImpl.h"
 #ifdef KRKRZ_ENABLE_CANVAS
@@ -678,6 +681,13 @@ protected:
 #ifdef KRKRZ_ENABLE_CANVAS
 	tTVPOpenGLScreen *openGlScreen;
 #endif
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+	/* Texture the software-decoded movie frames are uploaded into; see the
+	 * TVPLinuxVideo* bridge in VideoOvlImpl.cpp. */
+	SDL_Texture *videoTexture = nullptr;
+	int videoTextureWidth = 0;
+	int videoTextureHeight = 0;
+#endif
 	int lastMouseX;
 	int lastMouseY;
 
@@ -1004,6 +1014,25 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 	{
 		TVPThrowExceptionMessage(TJS_W("Cannot create SDL window: %1"), ttstr(SDL_GetError()));
 	}
+	/* Which video backend actually got used? A window that SDL creates through
+	 * the dummy/offscreen driver renders perfectly into memory while nothing
+	 * ever appears on the X server the launcher is watching - exactly the
+	 * "engine draws, screenshot is black" pattern seen in CI. */
+	{
+		const char *video_driver = SDL_GetCurrentVideoDriver();
+		const char *display = SDL_getenv("DISPLAY");
+		SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "VIDWINDOW driver=%s display=%s flags=0x%x size=%dx%d title=%s",
+			video_driver ? video_driver : "(null)",
+			display ? display : "(unset)",
+			(unsigned)SDL_GetWindowFlags(this->window),
+			new_window_w, new_window_h,
+			SDL_GetWindowTitle(this->window) ? SDL_GetWindowTitle(this->window) : "(null)");
+		/* NOTE: SDL_GetWindowWMInfo cannot be used here - this SDL build ships
+		 * no syswm backend at all, so SDL_SysWMinfo / SDL_SYSWM_X11 are not
+		 * even declared (it failed to compile with "SDL_SysWMinfo was not
+		 * declared in this scope"). The video driver plus DISPLAY above are
+		 * enough to tell that the window is created on a real X server. */
+	}
 #if defined(__EMSCRIPTEN__) && defined(KRKRSDL2_WINDOW_SIZE_IS_LAYER_SIZE)
 	EmscriptenFullscreenStrategy strategy;
 	SDL_memset(&strategy, 0, sizeof(strategy));
@@ -1035,17 +1064,22 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 	{
 #if !defined(__EMSCRIPTEN__) || (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
 #if defined(__ANDROID__) || defined(__OHOS__) || defined(__APPLE__)
-		/* Mobile platforms and macOS: prefer the hardware renderer - GLES2
-		 * on Android/OHOS, Metal on Apple platforms (Apple deprecated
-		 * OpenGL ES and SDL2 removed its iOS GLES backend). macOS needs a
-		 * renderer so the logical-size letterbox keeps the game picture
-		 * scaled to the fullscreen window instead of 1:1 in a corner, and
-		 * the video overlay follows the same transform. On OHOS the GLES2
+		/* Mobile platforms, macOS and Linux: prefer the hardware renderer -
+		 * GLES2 on Android/OHOS, Metal on Apple platforms (Apple deprecated
+		 * OpenGL ES and SDL2 removed its iOS GLES backend). These platforms
+		 * need a renderer so the logical-size letterbox keeps the game
+		 * picture scaled to the window instead of 1:1 in a corner, and the
+		 * video overlay follows the same transform. On OHOS the GLES2
 		 * probe's EGL initialization is also what makes the window's buffer
 		 * queue present software frames, so keep it even when it falls back
 		 * to software. The software renderer paints through the LockBuffer
 		 * path and TickBeat pauses whichever renderer is active while the
-		 * AVPlayer owns the surface. */
+		 * AVPlayer owns the surface.
+		 * Linux deliberately stays out of this list: on a host without
+		 * hardware GL (a virtual machine, for instance) an SDL renderer here
+		 * produced a window that never received a single frame, so Linux keeps
+		 * the plain window-surface path and gets its scaling from a software
+		 * blit in TickBeat instead. */
 		this->renderer = SDL_CreateRenderer(this->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 		if (!this->renderer)
 		{
@@ -1065,22 +1099,36 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 #endif
 
 		this->bitmapCompletion = new TVPSDLBitmapCompletion();
+		/* The engine always paints into its own RGB surface. It is recreated by
+		 * SetPaintBoxSize whenever the layer size changes, but an initial one
+		 * is allocated here so the first frames have a target even if that
+		 * call has not happened yet - relying on SetPaintBoxSize alone left
+		 * the window permanently empty when it did not fire.
+		 * TickBeat then either uploads this surface into the renderer texture
+		 * (platforms with a renderer) or scales it into the window surface
+		 * (Linux, see the software blit there). Taking the window surface here
+		 * instead made SDL_UpdateTexture upload the untouched window
+		 * framebuffer - a black picture - and freeing it later left SDL's own
+		 * window->surface dangling. */
 		{
-			/* Always create the window surface: the software renderer's
-			 * SDL_RenderPresent calls SDL_UpdateWindowSurface, which needs
-			 * window->surface_valid (set by SDL_GetWindowSurface). Without
-			 * this the software framebuffer is never uploaded and the
-			 * screen stays black/stuck on the last video frame. */
-			this->surface = SDL_GetWindowSurface(this->window);
+			int initial_w = 0;
+			int initial_h = 0;
+			SDL_GetWindowSize(this->window, &initial_w, &initial_h);
+			if (initial_w <= 0 || initial_h <= 0)
+			{
+				initial_w = 640;
+				initial_h = 480;
+			}
+			this->surface = SDL_CreateRGBSurface(0, initial_w, initial_h, 32,
+				0x00ff0000, 0x0000ff00, 0x000000ff, 0);
 			if (!this->surface)
 			{
-				TVPAddLog(ttstr("Cannot get surface from SDL window: ") + ttstr(SDL_GetError()));
+				TVPThrowExceptionMessage(TJS_W("Cannot create surface: %1"), ttstr(SDL_GetError()));
 			}
+			SDL_memset(this->surface->pixels, 0, (size_t)this->surface->h * (size_t)this->surface->pitch);
 			this->bitmapCompletion->surface = this->surface;
-		}
-		if (!this->renderer && !this->surface)
-		{
-			TVPThrowExceptionMessage(TJS_W("Cannot get surface or renderer from SDL window"));
+			SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "VIDINIT surface=%p %dx%d renderer=%p",
+				(void *)this->surface, initial_w, initial_h, (void *)this->renderer);
 		}
 		this->texture = nullptr;
 		if (this->renderer)
@@ -1131,6 +1179,13 @@ TVPWindowWindow::~TVPWindowWindow()
 		SDL_FreeSurface(this->surface);
 		this->surface = nullptr;
 	}
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+	if (this->videoTexture)
+	{
+		SDL_DestroyTexture(this->videoTexture);
+		this->videoTexture = nullptr;
+	}
+#endif
 	if (this->renderer)
 	{
 		SDL_DestroyRenderer(this->renderer);
@@ -1189,6 +1244,14 @@ void TVPWindowWindow::SetPaintBoxSize(tjs_int w, tjs_int h)
 			SDL_SetTextureScaleMode(this->texture, TVPGetTextureScaleMode());
 		}
 #endif
+	}
+
+	/* The engine's own drawing surface. It exists regardless of the renderer:
+	 * platforms that have one upload it into the texture above, Linux scales
+	 * it into the window surface in TickBeat. Creating it only when a renderer
+	 * was present is what made a smaller window clip a 1920x1080 picture
+	 * instead of scaling it. */
+	{
 		this->bitmapCompletion->surface = nullptr;
 		if (this->surface)
 		{
@@ -1206,13 +1269,11 @@ void TVPWindowWindow::SetPaintBoxSize(tjs_int w, tjs_int h)
 			TVPThrowExceptionMessage(TJS_W("Cannot create surface: %1"), ttstr(SDL_GetError()));
 		}
 		this->bitmapCompletion->surface = this->surface;
+		SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "VIDPAINTBOX %dx%d surface=%p renderer=%p",
+			w, h, (void *)this->surface, (void *)this->renderer);
 		/* SDL_CreateRGBSurface leaves the pixel memory uninitialised. Until
 		 * the game script paints its first frame the TickBeat render path
-		 * uploads whatever garbage sits in the buffer and RenderCopy draws
-		 * the WHOLE texture (FULL_UPDATES) - on OHOS this flashed a white
-		 * frame right after starting the game, before the logo movie. Clear
-		 * both the drawing surface and the renderer texture so the first
-		 * presented frame is black. */
+		 * presents whatever garbage sits in the buffer, so clear it. */
 		SDL_memset(this->surface->pixels, 0, (size_t)this->surface->h * (size_t)this->surface->pitch);
 		if (this->texture)
 		{
@@ -1270,6 +1331,26 @@ void TVPWindowWindow::UpdateMacOSBackingScale()
 
 void TVPWindowWindow::TranslateWindowToDrawArea(int &x, int &y)
 {
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+	/* Linux presents through the window surface: TickBeat scales the engine's
+	 * own surface into it with SDL_BlitScaled, so the picture fills the whole
+	 * window and window coordinates have to be scaled back into engine
+	 * coordinates. Without this, choosing a smaller resolution in windowed
+	 * mode rescaled the picture while every click stayed at its old position
+	 * (the buttons looked right but were not where they were drawn). */
+	if (this->window && this->surface && this->surface->w > 0 && this->surface->h > 0)
+	{
+		int window_w = 0;
+		int window_h = 0;
+		SDL_GetWindowSize(this->window, &window_w, &window_h);
+		if (window_w > 0 && window_h > 0 &&
+			(window_w != this->surface->w || window_h != this->surface->h))
+		{
+			x = MulDiv(x, this->surface->w, window_w);
+			y = MulDiv(y, this->surface->h, window_h);
+		}
+	}
+#endif
 #ifdef KRKRSDL2_ENABLE_ZOOM
 #ifdef KRKRZ_ENABLE_CANVAS
 	if (this->context)
@@ -1707,16 +1788,14 @@ void TVPWindowWindow::SetWidth(tjs_int w)
 		else
 #endif
 		SDL_SetWindowSize(this->window, w, h);
-		if (!this->renderer && this->surface)
-		{
-			this->bitmapCompletion->surface = nullptr;
-			this->surface = SDL_GetWindowSurface(this->window);
-			if (!this->surface)
-			{
-				TVPThrowExceptionMessage(TJS_W("Cannot get surface from SDL window: %1"), ttstr(SDL_GetError()));
-			}
-			this->bitmapCompletion->surface = this->surface;
-		}
+		/* The window was resized. The engine's own drawing surface keeps its
+		 * size (SetPaintBoxSize recreates it when the layer size changes) and
+		 * TickBeat scales it into the window surface, so there is nothing to do
+		 * here. The original window-surface path replaced this->surface with
+		 * the window surface at this point; in the current architecture that
+		 * defeats the scaling entirely, because SDL_BlitScaled then sees source
+		 * and destination as the same surface and does nothing - which is
+		 * exactly why choosing a smaller resolution only shrank the window. */
 	}
 #endif
 #ifdef KRKRSDL2_ENABLE_ZOOM
@@ -1742,16 +1821,14 @@ void TVPWindowWindow::SetHeight(tjs_int h)
 		else
 #endif
 		SDL_SetWindowSize(this->window, w, h);
-		if (!this->renderer && this->surface)
-		{
-			this->bitmapCompletion->surface = nullptr;
-			this->surface = SDL_GetWindowSurface(this->window);
-			if (!this->surface)
-			{
-				TVPThrowExceptionMessage(TJS_W("Cannot get surface from SDL window: %1"), ttstr(SDL_GetError()));
-			}
-			this->bitmapCompletion->surface = this->surface;
-		}
+		/* The window was resized. The engine's own drawing surface keeps its
+		 * size (SetPaintBoxSize recreates it when the layer size changes) and
+		 * TickBeat scales it into the window surface, so there is nothing to do
+		 * here. The original window-surface path replaced this->surface with
+		 * the window surface at this point; in the current architecture that
+		 * defeats the scaling entirely, because SDL_BlitScaled then sees source
+		 * and destination as the same surface and does nothing - which is
+		 * exactly why choosing a smaller resolution only shrank the window. */
 	}
 #endif
 #ifdef KRKRSDL2_ENABLE_ZOOM
@@ -1773,16 +1850,14 @@ void TVPWindowWindow::SetSize(tjs_int w, tjs_int h)
 		else
 #endif
 		SDL_SetWindowSize(this->window, w, h);
-		if (!this->renderer && this->surface)
-		{
-			this->bitmapCompletion->surface = nullptr;
-			this->surface = SDL_GetWindowSurface(this->window);
-			if (!this->surface)
-			{
-				TVPThrowExceptionMessage(TJS_W("Cannot get surface from SDL window: %1"), ttstr(SDL_GetError()));
-			}
-			this->bitmapCompletion->surface = this->surface;
-		}
+		/* The window was resized. The engine's own drawing surface keeps its
+		 * size (SetPaintBoxSize recreates it when the layer size changes) and
+		 * TickBeat scales it into the window surface, so there is nothing to do
+		 * here. The original window-surface path replaced this->surface with
+		 * the window surface at this point; in the current architecture that
+		 * defeats the scaling entirely, because SDL_BlitScaled then sees source
+		 * and destination as the same surface and does nothing - which is
+		 * exactly why choosing a smaller resolution only shrank the window. */
 	}
 #endif
 #ifdef KRKRSDL2_ENABLE_ZOOM
@@ -2068,6 +2143,103 @@ void TVPWindowWindow::TickBeat()
 		this->SetVisible(this->isVisible);
 	}
 	this->needsGraphicUpdate = true; // OHOS: always repaint so the software framebuffer is refreshed
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+	/* A playing movie owns the window. The decoder runs on its own thread and
+	 * publishes finished frames through the player owned by
+	 * tTJSNI_VideoOverlay, so the picture is uploaded and presented here and
+	 * the engine's own frame is skipped for as long as the movie lasts. */
+	bool video_presented = false;
+	if (TVPLinuxVideoIsActive())
+	{
+		const uint8_t *video_pixels = nullptr;
+		int video_pitch = 0;
+		int video_width = 0;
+		int video_height = 0;
+		bool video_is_new = false;
+		if (TVPLinuxVideoAcquireFrame(&video_pixels, &video_pitch, &video_width, &video_height, &video_is_new))
+		{
+			if (this->renderer)
+			{
+				if (this->videoTexture == nullptr ||
+					this->videoTextureWidth != video_width ||
+					this->videoTextureHeight != video_height)
+				{
+					if (this->videoTexture)
+					{
+						SDL_DestroyTexture(this->videoTexture);
+						this->videoTexture = nullptr;
+					}
+					/* BGRA rows from FFmpeg match ARGB8888 in little-endian memory. */
+					this->videoTexture = SDL_CreateTexture(this->renderer, SDL_PIXELFORMAT_ARGB8888,
+						SDL_TEXTUREACCESS_STREAMING, video_width, video_height);
+					this->videoTextureWidth = video_width;
+					this->videoTextureHeight = video_height;
+				}
+				if (this->videoTexture)
+				{
+					SDL_UpdateTexture(this->videoTexture, nullptr, video_pixels, video_pitch);
+					/* The renderer's logical size is the game resolution, so this
+					 * scales (and letterboxes) the movie like any other frame. */
+					SDL_RenderClear(this->renderer);
+					SDL_RenderCopy(this->renderer, this->videoTexture, nullptr, nullptr);
+					SDL_RenderPresent(this->renderer);
+					this->hasDrawn = true;
+				}
+			}
+			else if (this->window && video_is_new)
+			{
+				/* No renderer: wrap the decoded frame in a surface and scale it
+				 * into the window surface, mirroring the engine-picture path
+				 * further down. Only a freshly decoded frame is uploaded - the
+				 * window surface keeps its contents between uploads, and
+				 * re-blitting an unchanged 1920x1080 picture every iteration
+				 * would just burn CPU on a software-rendered host. */
+				SDL_Surface *window_surface = SDL_GetWindowSurface(this->window);
+				if (window_surface)
+				{
+					SDL_Surface *frame_surface = SDL_CreateRGBSurfaceFrom(
+						(void *)video_pixels, video_width, video_height, 32, video_pitch,
+						0x00ff0000, 0x0000ff00, 0x000000ff, 0);
+					if (frame_surface)
+					{
+						SDL_BlitScaled(frame_surface, nullptr, window_surface, nullptr);
+						SDL_FreeSurface(frame_surface);
+					}
+					SDL_Rect full;
+					full.x = 0;
+					full.y = 0;
+					full.w = window_surface->w;
+					full.h = window_surface->h;
+					SDL_UpdateWindowSurfaceRects(this->window, &full, 1);
+					this->hasDrawn = true;
+					static int video_soft_logs = 0;
+					if (video_soft_logs < 3)
+					{
+						SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+							"VIDEOSOFT frame=%dx%d window=%dx%d", video_width, video_height,
+							window_surface->w, window_surface->h);
+						video_soft_logs++;
+					}
+				}
+			}
+			TVPLinuxVideoReleaseFrame();
+			video_presented = true;
+		}
+	}
+	/* Reporting the end of the movie has to happen on this thread: SetStatus
+	 * delivers onStatusChanged inline and Movie.tjs's phase machine only
+	 * leaves "running" once it sees that stop. */
+	TVPLinuxVideoConsumeFinished();
+	/* Only skip the engine picture while a movie frame was actually drawn in
+	 * THIS iteration. Testing TVPLinuxVideoIsActive() instead kept returning
+	 * early after the movie had finished (the overlay stays active until
+	 * Movie.tjs closes it), so the engine never painted another frame and the
+	 * window went - and stayed - black. */
+	if (video_presented)
+	{
+		return;
+	}
+#endif
 #if defined(__OHOS__)
 	/* OHOS: while the AVPlayer renders into the XComponent surface, do NOT
 	 * present the SDL framebuffer - they share the same native window and
@@ -2116,6 +2288,16 @@ void TVPWindowWindow::TickBeat()
 #endif
 	if (this->needsGraphicUpdate)
 	{
+		static int vidtick_dbg = 0;
+		if (vidtick_dbg < 5)
+		{
+			SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+				"VIDTICK needs=%d bmp=%p win=%p surf=%p rnd=%p shaderr=%s",
+				(int)this->needsGraphicUpdate, (void *)this->bitmapCompletion,
+				(void *)this->window, (void *)this->surface, (void *)this->renderer,
+				SDL_GetError());
+			vidtick_dbg++;
+		}
 		if (this->bitmapCompletion)
 		{
 			SDL_Rect rect;
@@ -2194,6 +2376,33 @@ void TVPWindowWindow::TickBeat()
 			}
 			else if (this->window && this->surface)
 			{
+				/* No renderer (the Linux software path): scale the engine's own
+				 * drawing surface into the window surface, so a smaller window
+				 * shows a scaled-down picture instead of clipping a 1920x1080
+				 * one. This is what makes the resolution setting work. */
+				SDL_Surface *window_surface = SDL_GetWindowSurface(this->window);
+				static int soft_blit_logs = 0;
+				if (soft_blit_logs < 5)
+				{
+					SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+						"VIDREACH winsurf=%p same=%d winsurf_size=%dx%d rect=%d,%d %dx%d",
+						(void *)window_surface, window_surface == this->surface ? 1 : 0,
+						window_surface ? window_surface->w : 0, window_surface ? window_surface->h : 0,
+						rect.x, rect.y, rect.w, rect.h);
+					soft_blit_logs++;
+				}
+				if (window_surface != nullptr && window_surface != this->surface)
+				{
+					int blit = SDL_BlitScaled(this->surface, nullptr, window_surface, nullptr);
+					if (soft_blit_logs <= 5)
+					{
+						SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+							"VIDSOFTBLIT src=%dx%d dst=%dx%d result=%d err=%s",
+							this->surface->w, this->surface->h,
+							window_surface->w, window_surface->h,
+							blit, blit == 0 ? "-" : SDL_GetError());
+					}
+				}
 				SDL_UpdateWindowSurfaceRects(this->window, &rect, 1);
 				this->hasDrawn = true;
 			}

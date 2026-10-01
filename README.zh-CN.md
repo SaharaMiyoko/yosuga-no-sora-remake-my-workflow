@@ -2,21 +2,6 @@
 
 [English](README.md) | 简体中文
 
-**给主群用户：群临时封禁了七天，别去贴吧接着拱火了**
-
-关于本人为在“缘之空重制版事件”中所作出的不理性发言道歉 https://www.bilibili.com/opus/1251171303883276291?spm_id_from=333.1387.0.0
-
-2026.9.23 11:04 WarSkyGod留：
-我阴阳的从来不是正常玩家，而是那些跟风的串子，该删除的内容我们已经在v1.0.6之后删掉了，那段更新日志里的阴阳怪气是骂那些单纯过来发泄情绪的人，我气的是为什么有人可以对一个免费发布普惠大众的重制版Gal就因为一张免责声明的头图（你们应该知道那图很早以前就有了吧？原图是鸟穹做的，现在他已经跟我们切割了）而大肆辱骂，仿佛我们收了钱还是欠了他们什么东西一样，那张图我个人是无感的，对于这种免责声明类的东西我一向都是看一乐就好的态度，不支持不反对，该叫老婆叫老婆，我自己也一样，我是后加入这个制作组的，所以这张图其实在我加入前就有了，我不是很清楚制作组当时为什么要放这张图，可能是因为视觉风格上与游戏很协调吧，但我没想到有人非得较这个真，如果误伤到正常玩家了我道歉，对不起各位。但这整件事情非常令我寒心，有事情不能好好说话，非得带波节奏拱火来骂，制作组也是人，也会有情绪，本来一件可以正常解决的问题非要阴阳怪气挂到互联网上被人口诛笔伐，我们团队内部自然是有一些怨气在的，也会有一些情绪上的失控，尤其是我们是免费发布的，有人是合理诉求，但更多人只是单纯被带节奏来发泄戾气而已，我个人无意规训任何玩家该怎么玩游戏，我只是单纯不在意这些免责声明类的东西，我那些激进发言也是因为被一堆人骂恼了才发的，望理解。不过互联网这样子也不是一天两天了，唉
-
-对了，纠正一下，我们是高清重置组不是汉化组，很早以前我们曾讨论过是否重新汉化的问题，但得出的结论是没必要重复造轮子，所以汉化文本其实是用了星空网 Sphere 中文化委员会的汉化补丁，我们也在头图中注明了翻译是星空网 Sphere 中文化委员会，也没有更改汉化文本，这是一个很早的补丁了，里面其实有很多错别字，但碍于他们的协议我们没有改动。
-
-关于所谓“视频下架跑路”的谣言澄清：
-那些视频不是被我们主动下架的，而是被人恶意举报导致的下架，很多人都说我们出事了，所以赶紧屁滚尿流的下架跑路了，没有的事情，我们这种非官方无授权的民间自发重置的Gal本来就是灰色地带，我们也知道再申诉也大概率过不了审了
-
-<img width="529" height="450" alt="20aaead60631e9754b261997d2b489ee" src="https://github.com/user-attachments/assets/b2564e81-09ca-409f-af8c-3f5723d9e3fc" />
-<img width="854" height="1009" alt="6f1c49be09a09b7a33ee34692a7b6b67_720" src="https://github.com/user-attachments/assets/e9335eea-9fe6-4d76-b57b-b3331e46ada9" />
-
 本仓库是《缘之空》高清重制的完整游戏工程，主仓库位于
 [shuimo0413/yosuga-no-sora-remake](https://github.com/shuimo0413/yosuga-no-sora-remake)。
 跨平台运行时为 `src/` 中的 Kirikiri SDL2 引擎；`platform/` 下的 Windows KRKRZ
@@ -35,7 +20,9 @@ Android 移植改动）。
 - `ohos-project/`：面向 OpenHarmony 5.0（API 12）的 DevEco Studio/Hvigor 工程，
   包含 OpenHarmony SDL2 视频后端与 NAPI 入口模块，详见 `ohos-project/README.md`。
 - `platform/windows-krkrz/`：原生 Kirikiri Z Windows 运行时、插件和启动配置。
-- `tools/`：内容清单及后续发布工具。
+- `linglong.yaml`：如意玲珑（Linglong / linyaps）打包配置，Linux 构建与打包
+  说明见 `docs/linux-linglong.md`。
+- `tools/`：内容清单、发布与打包辅助工具。
 
 ## 获取源码
 
@@ -75,7 +62,8 @@ git submodule update --init --recursive
 
 SDL2 桌面端和 Android 工程均从 `data/` 读取游戏内容。Windows KRKRZ
 运行时已独立归档。目前已经支持自动打包 Windows KRKRZ、Android ARM64、
-Apple Silicon macOS、iOS ARM64 和 OpenHarmony 5.0 ARM64。
+Apple Silicon macOS、iOS ARM64、OpenHarmony 5.0 ARM64，以及 Linux x86_64
+（如意玲珑 UAB / layer）。
 
 ## 开发启动
 
@@ -98,6 +86,12 @@ macOS 使用 CMake 创建不包含素材副本的 SDL2 开发构建。第一次�
 
 ```sh
 ./project.sh run macos-sdl2
+```
+
+Linux 的开发构建与 macOS 一致，同样直接读取仓库中的 `data/`：
+
+```sh
+./project.sh run linux-sdl2
 ```
 
 需要传递引擎选项时，直接附加到命令末尾：
@@ -169,6 +163,30 @@ HAP（sign_mode `none`），安装前必须先用你自己的材料签名：
   `tools/sign_hap_agc.ps1` 在本地签名下载到的 HAP。完整说明（包括在 AGC 注册
   bundleName 一致的应用）见 `ohos-project/README.md`。已知限制（暂无 SDL 音频后端，
   游戏暂以静音运行）也记录在该文档中。
+
+## Linux 与如意玲珑发布
+
+Linux 版本同样由 Kirikiri SDL2 引擎构建，并以如意玲珑（Linglong / linyaps）格式
+打包。仓库根目录的 `linglong.yaml` 就是玲珑构建工程：`ll-builder` 会把仓库挂载为
+容器内的 `/project`，在 `data/` 就位的前提下编译引擎、把结果安装到 `$PREFIX`，
+最终导出可离线安装的 UAB（同时支持已弃用的 layer 格式）。
+
+```sh
+python tools/fetch_data_parts.py --dest data   # 玲珑包内嵌完整游戏内容
+ll-builder build
+ll-builder export -z zstd -o Yosuga-no-Sora-HD-Remake-Linux-x86_64.uab
+sudo ll-cli install ./Yosuga-no-Sora-HD-Remake-Linux-x86_64.uab
+```
+
+`release-linux-linglong.yml` 工作流在推送 `v*-linux-*` 标签或手动触发时运行：
+compile-check 模式只安装编译依赖并验证 Linux 目标能否编译（无需下载 4 GB 素材），
+完整模式则安装玲珑构建器、下载并校验游戏数据、执行可选的无头（Xvfb）冒烟测试、
+导出 UAB / layer，并按 GitHub 单个附件小于 2 GiB 的限制发布 7-Zip 分卷。
+
+应用 ID 为 `com.shuimo0413.yosuganosora.hdremake`（与 Android、Apple 端的标识一致），存档写入
+`$XDG_DATA_HOME/com.shuimo0413.yosuganosora.hdremake/savedata/`（默认
+`~/.local/share/com.shuimo0413.yosuganosora.hdremake/savedata/`），因此更新或重装应用都不会
+丢失存档。依赖、安装布局与故障排查详见 `docs/linux-linglong.md`。
 
 Kirikiri SDL2 源码使用 MIT 许可证，详见 `LICENSE`。每个二进制 Release 都随附
 `THIRD-PARTY-NOTICES.txt`（由 `tools/generate_notices.py` 生成），汇总了所有再分发

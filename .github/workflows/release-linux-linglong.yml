@@ -1,0 +1,644 @@
+name: Release Linux Linglong
+
+'on':
+  push:
+    tags:
+      - 'v*-linux-*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag, for example v0.1.0-linux-test.1'
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish as a prerelease'
+        required: true
+        default: false
+        type: boolean
+      mode:
+        description: 'full builds the linglong package; compile-check only verifies that the Linux target compiles'
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - compile-check
+      export_format:
+        description: 'Package format to export (UAB is the recommended, current format)'
+        required: true
+        default: uab
+        type: choice
+        options:
+          - uab
+          - both
+          - layer
+      compressor:
+        description: 'erofs compressor for the exported image: lz4 is fast, zstd is ~10x slower but a few percent smaller'
+        required: true
+        default: lz4
+        type: choice
+        options:
+          - lz4
+          - zstd
+      smoke_test:
+        description: 'Run the headless (Xvfb) smoke test after the build'
+        required: true
+        default: true
+        type: boolean
+      publish:
+        description: 'Create or update the GitHub Release with the built assets'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  # Every dispatch must be independent: keying on github.ref collapsed two
+  # manual dispatches into one group, so a second dispatch cancelled the first
+  # while it was still building (that is how linux-16 died). Keying on the
+  # release tag did not help either - inputs is not evaluated in this position,
+  # so the tag part was always empty. github.run_id is unique per run, and a
+  # release build is a one-shot job that does not need serialising anyway.
+  group: release-${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # The game data source release supplies data/; the Linux build compiles from
+  # the checked-out sources and the vendored submodules only.
+  LINGLONG_BASE: org.deepin.base/25.2.2
+
+jobs:
+  build-and-release:
+    name: Build the Linux linglong package and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          submodules: recursive
+          # The build never looks at history; only the working tree matters.
+          fetch-depth: 1
+
+      - name: Reclaim runner disk space
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # The current runner images have ~145 GB and this build finishes with
+          # 90+ GB still free, so the cleanup is usually pointless - and it is
+          # slow: unlinking the Android SDK alone (hundreds of thousands of
+          # files) took ~2 minutes. Only do it when the disk is actually small.
+          avail="$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')"
+          if [[ "${avail:-0}" -gt 40 ]]; then
+            echo "root has ${avail}G free; skipping the cleanup"
+            df -h /
+            exit 0
+          fi
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/node_modules
+          sudo apt-get clean
+          df -h /
+
+      - name: Resolve release metadata
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_EXPORT_FORMAT: ${{ inputs.export_format }}
+          INPUT_COMPRESSOR: ${{ inputs.compressor }}
+          INPUT_SMOKE_TEST: ${{ inputs.smoke_test }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          publish=true
+          mode="${INPUT_MODE:-full}"
+          export_format="${INPUT_EXPORT_FORMAT:-uab}"
+          compressor="${INPUT_COMPRESSOR:-lz4}"
+          smoke_test="${INPUT_SMOKE_TEST:-true}"
+          if [[ "$EVENT_NAME" == 'push' && "$GITHUB_REF" == refs/tags/* ]]; then
+            release_tag="$REF_NAME"
+            [[ "$release_tag" == *-* ]] && is_prerelease=true || is_prerelease=false
+          elif [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
+            release_tag="${INPUT_RELEASE_TAG//[[:space:]]/}"
+            is_prerelease="$INPUT_PRERELEASE"
+            # A manual run can build and export without touching the release,
+            # which is what the first validation runs use.
+            publish="${INPUT_PUBLISH:-true}"
+          else
+            release_tag="v0.0.0-ci.${GITHUB_RUN_NUMBER}"
+            is_prerelease=true
+            publish=false
+          fi
+          if [[ ! "$release_tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "Invalid release tag: $release_tag" >&2
+            exit 1
+          fi
+          # Numeric version extracted from the tag verbatim (shared with every
+          # other platform): v1.0.0 -> 1.0.0, v1.0.0-linux-x -> 1.0.0.
+          version_name="$(printf '%s' "$release_tag" | sed -nE 's/^v?([0-9]+(\.[0-9]+)*).*/\1/p')"
+          if [[ -z "$version_name" ]]; then
+            echo "Cannot derive a numeric version from tag: $release_tag" >&2
+            exit 1
+          fi
+          # linglong wants four numeric components (X.Y.Z.W).
+          case "$version_name" in
+            *.*.*.*) linglong_version="$version_name" ;;
+            *.*.*) linglong_version="$version_name.0" ;;
+            *.*) linglong_version="$version_name.0.0" ;;
+            *) linglong_version="$version_name.0.0.0" ;;
+          esac
+          {
+            echo "tag=$release_tag"
+            echo "version-name=$version_name"
+            echo "linglong-version=$linglong_version"
+            echo "build-number=$((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
+            echo "mode=$mode"
+            echo "export-format=$export_format"
+            echo "compressor=$compressor"
+            echo "smoke-test=$smoke_test"
+            echo "prerelease=$is_prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      # The .deb files are cached through a workspace directory rather than
+      # /var/cache/apt/archives, and saved explicitly right after the install
+      # instead of at the end of the job: a run that fails later (a compile
+      # error, a smoke test) never reached the implicit post-job save, so the
+      # cache stayed empty and every attempt had to reach ci.deepin.com again.
+      - name: Restore cached linglong builder packages
+        if: steps.release.outputs.mode == 'full'
+        id: deb-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.linglong-debs
+          key: linux-linglong-debs-v1
+
+      - name: Install the linglong builder
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Official OBS release repository. The distribution directory is
+          # 'Ubuntu_24.04' (the 'xUbuntu_24.04' spelling in older docs 404s).
+          echo 'deb [trusted=yes] https://ci.deepin.com/repo/obs/linglong:/CI:/release/Ubuntu_24.04/ ./' \
+            | sudo tee /etc/apt/sources.list.d/linglong.list
+          sudo apt-get update
+          # Reuse what an earlier run downloaded: ci.deepin.com is only
+          # reachable over a long haul from GitHub's runners, and a single
+          # timed-out fetch used to kill the entire build with
+          # "Could not connect to ci.deepin.com:443" / "stage pull dependency
+          # error" before anything was compiled.
+          mkdir -p "$GITHUB_WORKSPACE/.linglong-debs"
+          sudo cp -n "$GITHUB_WORKSPACE/.linglong-debs/"*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          # linglong-box owns the 'll-box' container helper. linglong-bin only
+          # lists it as one alternative of "linglong-box | crun", so apt is
+          # free to install crun instead and 'll-builder build' then dies with
+          # "ll-box not found" (exit 255). Install it explicitly.
+          installed=0
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get install -y --no-install-recommends \
+                 linglong-bin linglong-builder linglong-box; then
+              installed=1
+              break
+            fi
+            echo "::warning::apt-get install failed on attempt ${attempt}; retrying in 20s"
+            sleep 20
+          done
+          if [[ "$installed" != "1" ]]; then
+            echo "could not install the linglong builder after 5 attempts"
+            exit 1
+          fi
+          command -v ll-builder >/dev/null
+          sudo cp -n /var/cache/apt/archives/*.deb "$GITHUB_WORKSPACE/.linglong-debs/" 2>/dev/null || true
+          ll-cli --version || true
+          ll-builder --version || true
+          command -v ll-box || ls -l /usr/libexec/linglong/ll-box /usr/lib/linglong/ll-box 2>/dev/null || true
+          du -sh "$GITHUB_WORKSPACE/.linglong-debs" /var/cache/apt/archives 2>/dev/null || true
+
+      - name: Save cached linglong builder packages
+        if: steps.release.outputs.mode == 'full' && steps.deb-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.linglong-debs
+          key: linux-linglong-debs-v1
+
+      - name: Allow unprivileged user namespaces
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04 restricts unprivileged user namespaces through
+          # AppArmor; the linglong box (and fuse-overlayfs) need them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true
+
+      - name: Download the game data from the source release
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Optional repository variable: point it at another owner/repo (for
+          # example a mirror) to override the automatic data source lookup.
+          DATA_REPOSITORY: ${{ vars.DATA_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          rm -rf data
+          # The data-vN source releases are published in this repository.
+          # fetch_data_parts.py resolves it on its own: DATA_REPOSITORY when
+          # set, otherwise GITHUB_REPOSITORY (this repo), otherwise origin.
+          python3 tools/fetch_data_parts.py --dest data
+
+      - name: Inject the game version into status.tjs
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 tools/inject_game_version.py \
+            --tag "$RELEASE_TAG" \
+            --status data/system/Status.tjs
+
+      - name: Generate complete content manifest
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/generate_content_manifest.py \
+            --root data \
+            --output data/content-manifest.json \
+            --config content-packs.json \
+            --cache "$RUNNER_TEMP/content-manifest-cache.json" \
+            --full
+
+      - name: Point linglong.yaml at the release version
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        env:
+          LINGLONG_VERSION: ${{ steps.release.outputs.linglong-version }}
+        run: |
+          set -euo pipefail
+          python3 tools/update_linglong_version.py --version "$LINGLONG_VERSION"
+
+      - name: Configure and build the Linux target
+        if: steps.release.outputs.mode == 'compile-check'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fast feedback path: verify that the desktop Linux target still
+          # compiles without downloading the 4 GiB game data or paying for a
+          # full linglong build. Mirrors the build_depends list in linglong.yaml.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxinerama-dev libxss-dev libxkbcommon-dev libwayland-dev \
+            wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev \
+            libgles2-mesa-dev libasound2-dev libpulse-dev libdbus-1-dev \
+            libudev-dev libunwind-dev libfontconfig1-dev
+          cmake -S . -B build/linux-check -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DOPTION_BUILD_MACOS_BUNDLE=OFF \
+            -DKRKRSDL2_GENERATE_CONTENT_MANIFEST=OFF \
+            -DKRKRSDL2_INSTALL_LINUX_DATA=OFF
+          cmake --build build/linux-check --target krkrsdl2 --parallel "$(nproc)"
+          file build/linux-check/krkrsdl2
+          ldd build/linux-check/krkrsdl2 | sort
+
+      - name: Restore cached ccache
+        id: ccache
+        if: steps.release.outputs.mode == 'full'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # linglong.yaml exports CCACHE_DIR=/project/.ccache inside the build
+          # container, and /project is this checkout.
+          path: ${{ github.workspace }}/.ccache
+          key: linux-linglong-ccache-v1-${{ github.sha }}
+          restore-keys: |
+            linux-linglong-ccache-v1-
+
+      - name: Build the linglong package
+        if: steps.release.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          # 'll-builder build' mounts the project root as /project and installs
+          # into ${PREFIX} = /opt/apps/<id>/files inside the builder cache.
+          # ccache is a build_depends entry of linglong.yaml and writes to the
+          # host's ~/.cache/ccache (the container maps $HOME), which is exactly
+          # the directory the cache steps above restore and save.
+          #
+          # Building starts by pulling the base and the apt dependencies from
+          # the linglong remote, and that lookup intermittently times out with
+          # "stage pull dependency error" / "cannot send request to remote
+          # server" - an infrastructure hiccup that killed one whole run in a
+          # few minutes without compiling anything. Retry a few times so a
+          # transient network failure does not lose a 20 minute build.
+          built=0
+          for attempt in 1 2 3; do
+            if ll-builder build; then
+              built=1
+              break
+            fi
+            echo "::warning::ll-builder build failed on attempt ${attempt}; retrying in 30s"
+            sleep 30
+          done
+          if [[ "$built" != "1" ]]; then
+            echo "ll-builder build failed after 3 attempts"
+            exit 1
+          fi
+          ll-builder list
+
+      - name: Save cached ccache
+        if: steps.release.outputs.mode == 'full' && steps.ccache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: linux-linglong-ccache-v1-${{ github.sha }}
+
+      - name: Headless smoke test
+        if: steps.release.outputs.mode == 'full' && steps.release.outputs.smoke-test == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11-utils imagemagick python3-pil mesa-utils libgl1-mesa-dri
+          # Use an explicit Xvfb display so the screenshot below is taken from
+          # the very server the game renders into.
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          sleep 3
+          shot="$RUNNER_TEMP/linglong-shot.png"
+          log="$RUNNER_TEMP/linglong-run.log"
+          diag="$RUNNER_TEMP/linglong-diag.txt"
+          rm -f "$shot" "$diag"
+          # The engine needs a while to initialise, switch to fullscreen and
+          # paint its first frames; grab the framebuffer while it still runs.
+          # The X window tree is dumped at the same moment: the engine can be
+          # drawing perfectly (its own VIDSOFTBLIT log confirms the blit) while
+          # the screenshot stays black, and only the window tree shows whether
+          # the window was really mapped on this display.
+          (
+            # The engine paints its first frames within seconds; 60 s is ample
+            # and the framebuffer check reads the engine log anyway.
+            sleep 60
+            {
+              echo "=== xwininfo -root -tree ==="
+              xwininfo -root -tree 2>&1 || true
+              echo
+              echo "=== xlsclients ==="
+              xlsclients -l 2>&1 | head -n 40 || true
+              echo
+              # The engine logs the X11 id of its own window; ask the host
+              # directly whether that id exists here.
+              wid="$(grep -o 'VIDWINDOW x11 id=0x[0-9a-f]*' "$log" 2>/dev/null | tail -n 1 | awk '{print $4}')"
+              echo "=== engine X11 window id: ${wid:-<not logged yet>} ==="
+              if [[ -n "$wid" ]]; then
+                xwininfo -id "$wid" 2>&1 | head -n 12 || true
+              fi
+            } > "$diag" 2>&1
+            import -window root "$shot" 2>/dev/null || true
+          ) &
+          # Ask the container itself what it sees. If the engine's window id is
+          # visible in there but not on the host's :99, the container is talking
+          # to a different X server and no screenshot taken from the host can
+          # ever show the game.
+          set +e
+          echo 'echo "container DISPLAY=[$DISPLAY]"; ls -l /tmp/.X11-unix/ 2>&1; echo "--- x11 mounts ---"; grep -i "x11" /proc/self/mountinfo 2>/dev/null | head -n 10' \
+            | timeout 60 ll-builder run --exec /bin/sh > "$RUNNER_TEMP/container-env.txt" 2>&1
+          set -e
+          echo "--- container environment ---"
+          cat "$RUNNER_TEMP/container-env.txt" 2>/dev/null || true
+          set +e
+          timeout --signal=TERM --kill-after=30 120 ll-builder run > "$log" 2>&1
+          status=$?
+          set -e
+          echo "--- ll-builder run exit status: $status ---"
+          grep -v 'LYRIMGCHG' "$log" | tail -n 80 || true
+          cat "$diag" 2>/dev/null || true
+          ls -l "$shot" 2>/dev/null || echo "no screenshot was captured"
+
+      - name: Upload smoke test diagnostics
+        if: always() && steps.release.outputs.mode == 'full' && steps.release.outputs.smoke-test == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-diagnostics
+          path: |
+            ${{ runner.temp }}/linglong-shot.png
+            ${{ runner.temp }}/linglong-diag.txt
+            ${{ runner.temp }}/linglong-run.log
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Verify the headless run rendered a picture
+        if: steps.release.outputs.mode == 'full' && steps.release.outputs.smoke-test == 'true'
+        shell: bash
+        run: |
+          set +e
+          log="$RUNNER_TEMP/linglong-run.log"
+          shot="$RUNNER_TEMP/linglong-shot.png"
+
+          # Why the engine log is the signal and the host screenshot is not:
+          # ll-builder runs the game inside a container, and in this environment
+          # that container ends up talking to a different X server than the one
+          # the host screenshots. The host sees no X clients at all
+          # (xlsclients empty, xwininfo shows only root) while the engine logs
+          # driver=x11, DISPLAY=:99 and a SHOWN window - so a host-side
+          # screenshot can never contain the game, however correct the engine
+          # is. What the engine reports about its own frames is reliable.
+          fail=0
+          if ! grep -q 'VIDSOFTBLIT .*result=0' "$log"; then
+            echo "::error::the engine never presented a scaled frame"
+            grep -E 'VIDREACH|VIDSOFTBLIT|VIDTICK' "$log" | head -n 10 || true
+            fail=1
+          fi
+          frames="$(grep -c 'LYRIMGCHG' "$log" 2>/dev/null || echo 0)"
+          if [[ "${frames:-0}" -lt 3 ]]; then
+            echo "::error::the engine reported only ${frames:-0} layer updates, so it never drew"
+            fail=1
+          fi
+          echo "engine layer updates: ${frames:-0}"
+          grep -m1 'VIDSOFTBLIT' "$log" || true
+          grep -m1 'VIDWINDOW' "$log" || true
+
+          # Keep the framebuffer check as information only: an empty host
+          # screenshot is expected here and must not fail the build.
+          if [[ -f "$shot" ]]; then
+            python3 tools/check_smoke_screenshot.py "$shot" 2>&1 || \
+              echo "::warning::host screenshot is empty - expected, see the note above"
+          else
+            echo "no screenshot was captured"
+          fi
+          exit "$fail"
+
+      - name: Export the linglong package
+        if: steps.release.outputs.mode == 'full'
+        id: export
+        shell: bash
+        env:
+          EXPORT_FORMAT: ${{ steps.release.outputs.export-format }}
+          COMPRESSOR: ${{ steps.release.outputs.compressor }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$asset_dir"
+          icon="src/resources/linux/icons/hicolor/256x256/apps/yosuganosora.png"
+          arch="$(uname -m)"
+          if [[ "$EXPORT_FORMAT" == 'uab' || "$EXPORT_FORMAT" == 'both' ]]; then
+            # No --icon here: linglong 1.14 rejects it with "--icon requires
+            # --uabx" (exit 107). The launcher icon is already inside the
+            # package ($PREFIX/share/icons/hicolor), which is what the desktop
+            # entry uses; the UAB file icon is cosmetic by comparison.
+            #
+            # -z selects the erofs compressor used by mkfs.erofs. zstd is the
+            # experimental single-threaded path in erofs ("Therefore it will
+            # takes more time in order to get the optimal result") and took
+            # ~14 minutes for this 4 GiB payload; lz4 does it in minutes for a
+            # few percent more size, and the assets are already compressed.
+            ll-builder export -z "$COMPRESSOR" \
+              -o "$asset_dir/Yosuga-no-Sora-HD-Remake-Linux-$arch-$RELEASE_TAG.uab"
+          fi
+          if [[ "$EXPORT_FORMAT" == 'layer' || "$EXPORT_FORMAT" == 'both' ]]; then
+            # 'layer' is the deprecated format; it is still exported on demand
+            # for users of linglong releases that predate UAB. The command has
+            # to run in the project root (it reads linglong.yaml), so the
+            # produced layer is moved into the asset directory afterwards.
+            ll-builder export --layer --no-develop
+            shopt -s nullglob
+            layers=( ./*.layer )
+            [[ "${#layers[@]}" -gt 0 ]]
+            mv "${layers[@]}" "$asset_dir/"
+            shopt -u nullglob
+          fi
+          echo "asset-directory=$asset_dir" >> "$GITHUB_OUTPUT"
+          ls -lh "$asset_dir"
+
+      - name: Verify and split the release assets
+        if: steps.release.outputs.mode == 'full'
+        id: package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          ASSET_DIRECTORY: ${{ steps.export.outputs.asset-directory }}
+        run: |
+          set -euo pipefail
+          cd "$ASSET_DIRECTORY"
+          shopt -s nullglob
+          payloads=( *.uab *.layer )
+          if [[ "${#payloads[@]}" -eq 0 ]]; then
+            echo 'No linglong payload was exported.' >&2
+            exit 1
+          fi
+          for payload in "${payloads[@]}"; do
+            echo "payload: $payload ($(stat -c '%s' "$payload") bytes)"
+          done
+          seven_zip=$(command -v 7zz || command -v 7z || true)
+          if [[ -z "$seven_zip" ]]; then
+            sudo apt-get install -y --no-install-recommends p7zip-full
+            seven_zip=$(command -v 7z)
+          fi
+          for payload in "${payloads[@]}"; do
+            "$seven_zip" a -t7z -mx=0 -mmt=on -v1900m "${payload}.7z" "$payload"
+            "$seven_zip" t "${payload}.7z.001"
+            rm -f "$payload"
+          done
+          volumes=( *.7z.[0-9][0-9][0-9] )
+          [[ "${#volumes[@]}" -gt 0 ]]
+          {
+            echo 'Yosuga no Sora: HD Remake'
+            echo 'Runtime: Kirikiri SDL2 for Linux (x86_64), packaged for linglong/linyaps'
+            echo "Release: $RELEASE_TAG"
+            echo "Commit: $GITHUB_SHA"
+            echo "Base: $LINGLONG_BASE"
+            echo 'Native optimization: Release'
+            echo
+            echo 'The game content is embedded inside the package; nothing has to'
+            echo 'be downloaded after installation.'
+            echo
+            echo 'Install with:'
+            echo '  1. unpack every .7z.NNN volume into the same directory'
+            echo '     (open the .7z.001 with 7-Zip / p7zip)'
+            echo '  2. sudo ll-cli install ./Yosuga-no-Sora-HD-Remake-Linux-*.uab'
+            echo '  3. launch it from the application menu, or run'
+            echo '     ll-cli run com.shuimo0413.yosuganosora.hdremake'
+            echo
+            echo 'SHA-256 checksums of the release assets:'
+            for volume in "${volumes[@]}"; do
+              echo "$(sha256sum "$volume" | cut -d' ' -f1)  $volume"
+            done
+          } > BUILD-INFO.txt
+          python3 "$GITHUB_WORKSPACE/tools/generate_notices.py" --output THIRD-PARTY-NOTICES.txt
+          rm -rf "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/data"
+          ls -lh
+          echo "asset-directory=$ASSET_DIRECTORY" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        if: steps.release.outputs.mode == 'full' && steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          ASSET_DIRECTORY: ${{ steps.package.outputs.asset-directory }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=("$ASSET_DIRECTORY"/*)
+          [[ "${#assets[@]}" -gt 0 ]]
+          exists=false
+          is_draft=false
+          if json=$(gh release view "$RELEASE_TAG" --repo "$GH_REPOSITORY" \
+            --json isDraft 2>/dev/null); then
+            exists=true
+            is_draft=$(python3 -c \
+              'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' \
+              <<<"$json")
+          else
+            args=(release create "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft \
+              --title "$RELEASE_TAG" --generate-notes)
+            [[ "$EVENT_NAME" == 'push' ]] && args+=(--verify-tag) || args+=(--target "$COMMIT_SHA")
+            [[ "$IS_PRERELEASE" == 'true' ]] && args+=(--prerelease)
+            if ! gh "${args[@]}"; then
+              for ((attempt = 1; attempt <= 12; attempt++)); do
+                if json=$(gh release view "$RELEASE_TAG" --repo "$GH_REPOSITORY" \
+                  --json isDraft 2>/dev/null); then
+                  exists=true
+                  is_draft=$(python3 -c \
+                    'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' \
+                    <<<"$json")
+                  break
+                fi
+                echo "Waiting for another workflow to create the release ($attempt/12)."
+                sleep 5
+              done
+              [[ "$exists" == 'true' ]] || exit 1
+            fi
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GH_REPOSITORY" --clobber
+          if [[ "$exists" == 'false' || "$is_draft" == 'true' ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft=false
+          fi

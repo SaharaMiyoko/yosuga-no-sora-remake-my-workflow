@@ -2,22 +2,6 @@
 
 English | [简体中文](README.zh-CN.md)
 
-**给主群用户：群临时封禁了七天，别去贴吧接着拱火了**
-
-关于本人为在“缘之空重制版事件”中所作出的不理性发言道歉 https://www.bilibili.com/opus/1251171303883276291?spm_id_from=333.1387.0.0
-
-2026.9.23 11:04 WarSkyGod留：
-我阴阳的从来不是正常玩家，而是那些跟风的串子，该删除的内容我们已经在v1.0.6之后删掉了，那段更新日志里的阴阳怪气是骂那些单纯过来发泄情绪的人，我气的是为什么有人可以对一个免费发布普惠大众的重制版Gal就因为一张免责声明的头图（你们应该知道那图很早以前就有了吧？原图是鸟穹做的，现在他已经跟我们切割了）而大肆辱骂，仿佛我们收了钱还是欠了他们什么东西一样，那张图我个人是无感的，对于这种免责声明类的东西我一向都是看一乐就好的态度，不支持不反对，该叫老婆叫老婆，我自己也一样，我是后加入这个制作组的，所以这张图其实在我加入前就有了，我不是很清楚制作组当时为什么要放这张图，可能是因为视觉风格上与游戏很协调吧，但我没想到有人非得较这个真，如果误伤到正常玩家了我道歉，对不起各位。但这整件事情非常令我寒心，有事情不能好好说话，非得带波节奏拱火来骂，制作组也是人，也会有情绪，本来一件可以正常解决的问题非要阴阳怪气挂到互联网上被人口诛笔伐，我们团队内部自然是有一些怨气在的，也会有一些情绪上的失控，尤其是我们是免费发布的，有人是合理诉求，但更多人只是单纯被带节奏来发泄戾气而已，我个人无意规训任何玩家该怎么玩游戏，我只是单纯不在意这些免责声明类的东西，我那些激进发言也是因为被一堆人骂恼了才发的，望理解。不过互联网这样子也不是一天两天了，唉
-
-对了，纠正一下，我们是高清重置组不是汉化组，很早以前我们曾讨论过是否重新汉化的问题，但得出的结论是没必要重复造轮子，所以汉化文本其实是用了星空网 Sphere 中文化委员会的汉化补丁，我们也在头图中注明了翻译是星空网 Sphere 中文化委员会，也没有更改汉化文本，这是一个很早的补丁了，里面其实有很多错别字，但碍于他们的协议我们没有改动。
-
-关于所谓“视频下架跑路”的谣言澄清：
-那些视频不是被我们主动下架的，而是被人恶意举报导致的下架，很多人都说我们出事了，所以赶紧屁滚尿流的下架跑路了，没有的事情，我们这种非官方无授权的民间自发重置的Gal本来就是灰色地带，我们也知道再申诉也大概率过不了审了
-
-<img width="529" height="450" alt="20aaead60631e9754b261997d2b489ee" src="https://github.com/user-attachments/assets/87bf7119-21a1-42e6-b413-73826db84e96" />
-<img width="854" height="1009" alt="6f1c49be09a09b7a33ee34692a7b6b67_720" src="https://github.com/user-attachments/assets/cbab5a45-40bf-4160-b60b-61b2f6ffe1a3" />
-
-
 This repository contains the complete game project for the Yosuga no Sora HD
 remake. The main repository lives at
 [shuimo0413/yosuga-no-sora-remake](https://github.com/shuimo0413/yosuga-no-sora-remake).
@@ -42,7 +26,9 @@ port that produced the first Android release).
   module; see `ohos-project/README.md`.
 - `platform/windows-krkrz/` contains the native Kirikiri Z Windows runtime,
   plugins, and startup configuration.
-- `tools/` contains content-manifest utilities and future release tooling.
+- `linglong.yaml` is the linglong (linyaps) packaging manifest of the Linux
+  build; see `docs/linux-linglong.md`.
+- `tools/` contains content-manifest, release, and packaging tooling.
 
 ## Getting the Source
 
@@ -78,7 +64,7 @@ new release automatically.
 The SDL2 desktop targets and Android project both read game content from
 `data/`. The Windows KRKRZ runtime is stored separately under `platform/`.
 Automated release packaging covers Windows KRKRZ, Android ARM64, Apple Silicon
-macOS, iOS ARM64, and OpenHarmony 5.0 ARM64.
+macOS, iOS ARM64, OpenHarmony 5.0 ARM64, and Linux x86_64 (linglong UAB / layer).
 
 ## Development Launchers
 
@@ -110,6 +96,16 @@ build incrementally:
 
 ```sh
 ./project.sh run macos-sdl2
+```
+
+### Linux SDL2
+
+On Linux the development build works the same way: CMake compiles an SDL2
+build that reads the repository's `data/` directory directly, without
+installing anything:
+
+```sh
+./project.sh run linux-sdl2
 ```
 
 Append engine options directly to a launcher command when needed:
@@ -200,6 +196,35 @@ default (sign_mode `none`); you must sign it before installing:
   the app in AGC with the matching bundle name) are in
   `ohos-project/README.md`. Known limitations (no SDL audio backend yet,
   so the game runs without sound) are listed there as well.
+
+## Linux and Linglong Releases
+
+The Linux build uses the same Kirikiri SDL2 engine and is packaged with
+linglong (linyaps), the container-based application format. The repository root
+*is* the linglong build project: `linglong.yaml` makes `ll-builder` mount the
+checkout as `/project` inside the build container, compile the engine, install
+it into `$PREFIX` with the complete game data, and export a self-contained UAB
+(the deprecated layer format is supported as well).
+
+```sh
+python tools/fetch_data_parts.py --dest data   # the package embeds the full game content
+ll-builder build
+ll-builder export -z zstd -o Yosuga-no-Sora-HD-Remake-Linux-x86_64.uab
+sudo ll-cli install ./Yosuga-no-Sora-HD-Remake-Linux-x86_64.uab
+```
+
+The `release-linux-linglong.yml` workflow runs for `v*-linux-*` tags and on
+manual dispatch. Its `compile-check` mode only installs the build dependencies
+and verifies that the Linux target still compiles (no 4 GiB download); the
+`full` mode installs the linglong builder, downloads and verifies the game
+data, runs an optional headless (Xvfb) smoke test, exports UAB / layer, and
+publishes 7-Zip volumes below GitHub's 2 GiB per-asset limit.
+
+The application id is `com.shuimo0413.yosuganosora.hdremake` (the same identifier Android and the
+Apple bundles use) and saves live in `$XDG_DATA_HOME/com.shuimo0413.yosuganosora.hdremake/savedata/`
+(by default `~/.local/share/com.shuimo0413.yosuganosora.hdremake/savedata/`), so updating or
+reinstalling the package never destroys save data. Dependencies, install
+layout, and troubleshooting are documented in `docs/linux-linglong.md`.
 
 The Kirikiri SDL2 source code is licensed under the MIT License; see `LICENSE`.
 Every binary release ships a `THIRD-PARTY-NOTICES.txt` (generated by
