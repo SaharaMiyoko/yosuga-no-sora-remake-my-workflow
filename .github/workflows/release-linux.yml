@@ -58,6 +58,7 @@ jobs:
     name: Build Linux packages (Flatpak & Tarball) and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+
     steps:
       - name: Check out repository and submodules
         uses: actions/checkout@v4
@@ -448,10 +449,17 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <component type="desktop-application">
             <id>$app_id</id>
-            <metadata_license>CC0-1.0</metadata_license>
-            <project_license>Proprietary</project_license>
-            <name>Yosuga no Sora: HD Remake</name>
+            <metadata_license>Proprietary</metadata_license>
+            <project_license>MIT License & Proprietary</project_license>
+            <name>Yosuga no Sora HD Remake</name>
             <summary>Yosuga no Sora HD Remake for Linux</summary>
+            <description>
+              <p>Yosuga no Sora HD Remake for Linux.</p>
+            </description>
+            <launchable type="desktop-id">$app_id.desktop</launchable>
+            <provides>
+              <id>$app_id.desktop</id>
+            </provides>
           </component>
           EOF
 
@@ -461,6 +469,7 @@ jobs:
           runtime-version: '$RUNTIME_VER'
           sdk: org.freedesktop.Sdk
           command: yosuganosora
+          appstream-compose: false
           build-options:
             no-debuginfo: true
             strip: false
@@ -481,7 +490,7 @@ jobs:
                 - mkdir -p /app/share/yosuganosora
                 - cp -r data /app/share/yosuganosora/
                 - install -Dm644 $app_id.desktop /app/share/applications/$app_id.desktop
-                - install -Dm644 $app_id.png /app/share/icons/hicolor/256x256/apps/$app_id.png
+                - test -f $app_id.png && install -Dm644 $app_id.png /app/share/icons/hicolor/256x256/apps/$app_id.png || true
                 - install -Dm644 $app_id.metainfo.xml /app/share/metainfo/$app_id.metainfo.xml
               sources:
                 - type: dir
@@ -521,7 +530,7 @@ jobs:
           fi
 
           for payload in "${payloads[@]}"; do
-            size_mb=$(($(stat -c '\%s' "$payload") / 1024 / 1024))
+            size_mb=$(($(stat -c '%s' "$payload") / 1024 / 1024))
             echo "Inspecting $payload (${size_mb} MB)..."
             # GitHub Releases API strictly enforces a 2 GiB per-file upload limit.
             if [[ "$size_mb" -gt 1950 ]]; then
@@ -557,7 +566,7 @@ jobs:
             echo '=================='
             for f in "${all_assets[@]}"; do
               if [[ -f "$f" ]]; then
-                echo "$(sha256sum "$f" \vert{} cut -d' ' -f1)  $f"
+                echo "$(sha256sum "$f" | cut -d' ' -f1)  $f"
               fi
             done
           } > BUILD-INFO.txt
@@ -598,7 +607,7 @@ jobs:
           else
             args=(release create "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft \
               --title "$RELEASE_TAG" --generate-notes)
-            [[ "$EVENT_NAME" == 'push' ]] && args+=(--verify-tag) \vert{}\vert{} args+=(--target "$COMMIT_SHA")
+            [[ "$EVENT_NAME" == 'push' ]] && args+=(--verify-tag) || args+=(--target "$COMMIT_SHA")
             [[ "$IS_PRERELEASE" == 'true' ]] && args+=(--prerelease)
             if ! gh "${args[@]}"; then
               for ((attempt = 1; attempt <= 12; attempt++)); do
@@ -620,7 +629,6 @@ jobs:
           gh release upload "$RELEASE_TAG" "${assets[@]}" \
             --repo "$GH_REPOSITORY" --clobber
 
-          if [[ "$exists" == 'false' \vert{}\vert{} "$is_draft" == 'true' ]]; then
+          if [[ "$exists" == 'false' || "$is_draft" == 'true' ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft=false
           fi
-
