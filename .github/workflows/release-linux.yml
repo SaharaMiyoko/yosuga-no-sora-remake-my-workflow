@@ -151,7 +151,8 @@ jobs:
             libxinerama-dev libxss-dev libxkbcommon-dev libwayland-dev \
             wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev \
             libgles2-mesa-dev libasound2-dev libpulse-dev libdbus-1-dev \
-            libudev-dev libunwind-dev libfontconfig1-dev
+            libudev-dev libunwind-dev libfontconfig1-dev \
+            libavcodec-dev libavformat-dev libswscale-dev libswresample-dev libavutil-dev
 
       - name: Set up Flathub Freedesktop Runtime
         if: steps.release.outputs.mode == 'full' && (steps.release.outputs.package-formats == 'both' || steps.release.outputs.package-formats == 'flatpak')
@@ -333,10 +334,15 @@ jobs:
           arch="$(uname -m)"
           dir_name="Yosuga-no-Sora-HD-Remake-Linux-$arch-$RELEASE_TAG"
           stage_dir="$RUNNER_TEMP/stage-tarball/$dir_name"
-          mkdir -p "$stage_dir"
+          mkdir -p "$stage_dir/lib"
 
           cp build/linux-release/krkrsdl2 "$stage_dir/"
           cp -r data "$stage_dir/"
+
+          # Bundle FFmpeg runtime libraries to guarantee compatibility across diverse Linux distributions
+          for lib in libavformat libavcodec libswscale libswresample libavutil; do
+            cp -a /usr/lib/x86_64-linux-gnu/${lib}.so* "$stage_dir/lib/" 2>/dev/null || true
+          done
 
           icon="src/resources/linux/icons/hicolor/256x256/apps/yosuganosora.png"
           if [[ -f "$icon" ]]; then
@@ -347,6 +353,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+          export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:${LD_LIBRARY_PATH:-}"
           cd "$SCRIPT_DIR"
           exec ./krkrsdl2 "$@"
           EOF
@@ -382,13 +389,19 @@ jobs:
           arch="$(uname -m)"
           app_id="com.nichinichisou0607.yosuganosora.hdremake"
           flatpak_work="$RUNNER_TEMP/flatpak-work"
-          mkdir -p "$flatpak_work/staged"
+          mkdir -p "$flatpak_work/staged/lib"
 
           cp build/linux-release/krkrsdl2 "$flatpak_work/staged/"
           cp -r data "$flatpak_work/staged/"
 
+          # Bundle FFmpeg runtime libraries to prevent soname version mismatch with the Flatpak runtime
+          for lib in libavformat libavcodec libswscale libswresample libavutil; do
+            cp -a /usr/lib/x86_64-linux-gnu/${lib}.so* "$flatpak_work/staged/lib/" 2>/dev/null || true
+          done
+
           cat << 'EOF' > "$flatpak_work/staged/yosuganosora"
           #!/bin/sh
+          export LD_LIBRARY_PATH="/app/lib:${LD_LIBRARY_PATH:-}"
           USER_GAME_DIR="${XDG_DATA_HOME:-$HOME/.var/app/com.nichinichisou0607.yosuganosora.hdremake/data}/yosuganosora"
           mkdir -p "$USER_GAME_DIR"
           if [ ! -e "$USER_GAME_DIR/data" ]; then
@@ -444,6 +457,8 @@ jobs:
               build-commands:
                 - install -Dm755 krkrsdl2 /app/bin/krkrsdl2
                 - install -Dm755 yosuganosora /app/bin/yosuganosora
+                - mkdir -p /app/lib
+                - cp -a lib/. /app/lib/ 2>/dev/null || true
                 - mkdir -p /app/share/yosuganosora
                 - cp -r data /app/share/yosuganosora/
                 - install -Dm644 $app_id.desktop /app/share/applications/$app_id.desktop
