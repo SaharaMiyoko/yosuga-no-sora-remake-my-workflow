@@ -58,7 +58,6 @@ jobs:
     name: Build Linux packages (Flatpak & Tarball) and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-
     steps:
       - name: Check out repository and submodules
         uses: actions/checkout@v4
@@ -121,7 +120,7 @@ jobs:
             echo "Invalid release tag: $release_tag" >&2
             exit 1
           fi
-          version_name="$(printf '%s' "$release_tag" | sed -nE 's/^v?([0-9]+(\.[0-9]+)*).*/\1/p')"
+          version_name="$(printf '\%s' "$release_tag" | sed -nE 's/^v?([0-9]+(\.[0-9]+)*).*/\1/p')"
           if [[ -z "$version_name" ]]; then
             echo "Cannot derive a numeric version from tag: $release_tag" >&2
             exit 1
@@ -146,7 +145,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config ccache \
-            lbzip2 p7zip-full flatpak flatpak-builder \
+            lbzip2 p7zip-full flatpak flatpak-builder elfutils \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxinerama-dev libxss-dev libxkbcommon-dev libwayland-dev \
             wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev \
@@ -256,16 +255,28 @@ jobs:
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends \
             xvfb x11-utils imagemagick python3-pil mesa-utils libgl1-mesa-dri
+
           export DISPLAY=:99
+          export SDL_AUDIODRIVER=dummy
+          export SDL_VIDEODRIVER=x11
+          export LIBGL_ALWAYS_SOFTWARE=1
+
           Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
           sleep 3
+
           shot="$RUNNER_TEMP/game-smoke-shot.png"
           log="$RUNNER_TEMP/game-smoke-run.log"
           diag="$RUNNER_TEMP/game-smoke-diag.txt"
           rm -f "$shot" "$diag"
 
+          smoke_dir="$RUNNER_TEMP/smoke-run"
+          mkdir -p "$smoke_dir"
+          cp build/linux-release/krkrsdl2 "$smoke_dir/"
+          ln -sfn "$GITHUB_WORKSPACE/data" "$smoke_dir/data"
+          ln -sfn "$GITHUB_WORKSPACE/data" build/linux-release/data
+
           (
-            sleep 15
+            sleep 25
             {
               echo "=== xwininfo -root -tree ==="
               xwininfo -root -tree 2>&1 || true
@@ -276,11 +287,12 @@ jobs:
           ) &
 
           set +e
-          timeout --signal=TERM --kill-after=20 45 ./build/linux-release/krkrsdl2 > "$log" 2>&1
+          cd "$smoke_dir"
+          timeout --signal=TERM --kill-after=20 60 ./krkrsdl2 > "$log" 2>&1
           status=$?
           set -e
           echo "--- Smoke test exit status: $status ---"
-          grep -v 'LYRIMGCHG' "$log" | tail -n 80 || true
+          cat "$log" || true
           cat "$diag" 2>/dev/null || true
           ls -l "$shot" 2>/dev/null || echo "no screenshot was captured"
 
@@ -310,12 +322,16 @@ jobs:
             grep -E 'VIDREACH|VIDSOFTBLIT|VIDTICK' "$log" | head -n 10 || true
             fail=1
           fi
-          frames="$(grep -c 'LYRIMGCHG' "$log" 2>/dev/null || echo 0)"
-          if [[ "${frames:-0}" -lt 3 ]]; then
-            echo "::error::Engine reported fewer than 3 layer updates (${frames:-0})"
+
+          raw_frames="$(grep -c 'LYRIMGCHG' "$log" 2>/dev/null || true)"
+          frames="$(echo "$raw_frames" | tr -dc '0-9')"
+          frames="${frames:-0}"
+          if [[ "$frames" -lt 3 ]]; then
+            echo "::error::Engine reported fewer than 3 layer updates ($frames)"
             fail=1
           fi
-          echo "Engine layer updates: ${frames:-0}"
+          echo "Engine layer updates: $frames"
+
           if [[ -f "$shot" ]]; then
             python3 tools/check_smoke_screenshot.py "$shot" 2>&1 || true
           fi
@@ -445,6 +461,9 @@ jobs:
           runtime-version: '$RUNTIME_VER'
           sdk: org.freedesktop.Sdk
           command: yosuganosora
+          build-options:
+            no-debuginfo: true
+            strip: false
           finish-args:
             - --share=ipc
             - --socket=fallback-x11
@@ -502,7 +521,7 @@ jobs:
           fi
 
           for payload in "${payloads[@]}"; do
-            size_mb=$(($(stat -c '%s' "$payload") / 1024 / 1024))
+            size_mb=$(($(stat -c '\%s' "$payload") / 1024 / 1024))
             echo "Inspecting $payload (${size_mb} MB)..."
             # GitHub Releases API strictly enforces a 2 GiB per-file upload limit.
             if [[ "$size_mb" -gt 1950 ]]; then
@@ -538,7 +557,7 @@ jobs:
             echo '=================='
             for f in "${all_assets[@]}"; do
               if [[ -f "$f" ]]; then
-                echo "$(sha256sum "$f" | cut -d' ' -f1)  $f"
+                echo "$(sha256sum "$f" \vert{} cut -d' ' -f1)  $f"
               fi
             done
           } > BUILD-INFO.txt
@@ -579,7 +598,7 @@ jobs:
           else
             args=(release create "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft \
               --title "$RELEASE_TAG" --generate-notes)
-            [[ "$EVENT_NAME" == 'push' ]] && args+=(--verify-tag) || args+=(--target "$COMMIT_SHA")
+            [[ "$EVENT_NAME" == 'push' ]] && args+=(--verify-tag) \vert{}\vert{} args+=(--target "$COMMIT_SHA")
             [[ "$IS_PRERELEASE" == 'true' ]] && args+=(--prerelease)
             if ! gh "${args[@]}"; then
               for ((attempt = 1; attempt <= 12; attempt++)); do
@@ -601,6 +620,7 @@ jobs:
           gh release upload "$RELEASE_TAG" "${assets[@]}" \
             --repo "$GH_REPOSITORY" --clobber
 
-          if [[ "$exists" == 'false' || "$is_draft" == 'true' ]]; then
+          if [[ "$exists" == 'false' \vert{}\vert{} "$is_draft" == 'true' ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GH_REPOSITORY" --draft=false
           fi
+
