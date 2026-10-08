@@ -380,7 +380,7 @@ jobs:
           asset_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$asset_dir"
           arch="$(uname -m)"
-          app_id="com.shuimo0413.yosuganosora.hdremake"
+          app_id="com.nichinichisou0607.yosuganosora.hdremake"
           flatpak_work="$RUNNER_TEMP/flatpak-work"
           mkdir -p "$flatpak_work/staged"
 
@@ -389,7 +389,7 @@ jobs:
 
           cat << 'EOF' > "$flatpak_work/staged/yosuganosora"
           #!/bin/sh
-          USER_GAME_DIR="${XDG_DATA_HOME:-$HOME/.var/app/com.shuimo0413.yosuganosora.hdremake/data}/yosuganosora"
+          USER_GAME_DIR="${XDG_DATA_HOME:-$HOME/.var/app/com.nichinichisou0607.yosuganosora.hdremake/data}/yosuganosora"
           mkdir -p "$USER_GAME_DIR"
           if [ ! -e "$USER_GAME_DIR/data" ]; then
             ln -s /app/share/yosuganosora/data "$USER_GAME_DIR/data"
@@ -512,7 +512,7 @@ jobs:
             echo '1. Flatpak package (.flatpak):'
             echo '   - If single file: flatpak install ./Yosuga-no-Sora-*.flatpak'
             echo '   - If split (.7z.NNN): extract with 7-Zip or p7zip first, then run flatpak install'
-            echo '   - Run with: flatpak run com.shuimo0413.yosuganosora.hdremake'
+            echo '   - Run with: flatpak run com.nichinichisou0607.yosuganosora.hdremake'
             echo
             echo '2. Standard Tarball (.tar.bz2):'
             echo '   - If single file: tar -xjf ./Yosuga-no-Sora-*.tar.bz2'
