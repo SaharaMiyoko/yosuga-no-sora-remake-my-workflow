@@ -84,25 +84,6 @@ jobs:
           gh release create "$tag" \
             *.zip \
             data-assets.json
-      - name: Inject the game version into status.tjs
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          set -euo pipefail
-          python3 tools/inject_game_version.py \
-            --tag "$RELEASE_TAG" \
-            --status data/system/Status.tjs
-      - name: Generate and validate the content manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 tools/generate_content_manifest.py \
-            --root data \
-            --output data/content-manifest.json \
-            --config content-packs.json \
-            --cache "$RUNNER_TEMP/content-manifest-cache.json" \
-            --full
       - name: Package game data assets
         id: data
         shell: bash
