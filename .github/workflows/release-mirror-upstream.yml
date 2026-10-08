@@ -72,18 +72,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-        tag="data-v1"
-        wget \
-          https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/data-assets.json
-        wget \
-          https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-01-v1.0.9.zip
-        wget \
-          https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-02-v1.0.9.zip
-        wget \
-          https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-03-v1.0.9.zip
-        gh release create "$tag" \
-          *.zip \
-          data-assets.json
+          tag="data-v1"
+          wget \
+            https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/data-assets.json
+          wget \
+            https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-01-v1.0.9.zip
+          wget \
+            https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-02-v1.0.9.zip
+          wget \
+            https://github.com/shuimo0413/yosuga-no-sora-remake/releases/download/v1.0.9/Yosuga-no-Sora-HD-Remake-data-03-v1.0.9.zip
+          gh release create "$tag" \
+            *.zip \
+            data-assets.json
       - name: Inject the game version into status.tjs
         shell: bash
         env:
@@ -91,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/inject_game_version.py \
-        --tag "$RELEASE_TAG" \
+            --tag "$RELEASE_TAG" \
             --status data/system/Status.tjs
       - name: Generate and validate the content manifest
         shell: bash
