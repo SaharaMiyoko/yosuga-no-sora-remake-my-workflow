@@ -51,7 +51,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APP_ID: 'com.shuimo0413.yosuganosora.hdremake'
+  APP_ID: 'com.nichinichisou0607.yosuganosora.hdremake'
   FLATPAK_RUNTIME_VERSION: '25.08'
   FFMPEG_VERSION: '6.1.2'
 
