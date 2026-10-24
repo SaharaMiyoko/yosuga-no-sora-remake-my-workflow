@@ -1,4 +1,4 @@
-name: Release Linux (Flatpak & Tarball)
+name: Release Linux (Flatpak & Tarball) -new
 
 'on':
   push:
