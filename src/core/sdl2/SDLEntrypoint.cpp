@@ -10,6 +10,10 @@
 #include <cstdlib>
 #include "ios/IOSBootstrap.h"
 #endif
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+#include <cstdlib>
+#include "linux/LinuxBootstrap.h"
+#endif
 
 #if defined(USE_SDL_MAIN)
 extern "C" int SDL_main(int argc, char **argv)
@@ -34,6 +38,15 @@ extern "C" int main(int argc, char **argv)
 		 * before the engine initializes when the game data is missing.
 		 * Mirrors the OpenHarmony shell page. */
 		if (!krkrsdl2_ios_run_bootstrap())
+		{
+			exit(0);
+		}
+#endif
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+		/* Linux data externalization (standalone AppImage): runs as a fast
+		 * stat() no-op when game data is bundled or passed on the command line,
+		 * and opens the native bootstrap UI when external data is missing. */
+		if (!krkrsdl2_linux_run_bootstrap(argc, argv))
 		{
 			exit(0);
 		}
