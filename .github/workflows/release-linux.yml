@@ -1,4 +1,4 @@
-name: Release Linux (Flatpak & Tarball)
+name: Release Linux (Flatpak, Tarball & AppImage)
 
 'on':
   push:
@@ -24,14 +24,16 @@ name: Release Linux (Flatpak & Tarball)
           - full
           - compile-check
       package_formats:
-        description: 'Package formats to build and export'
+        description: 'all = Flatpak + Tarball + standalone AppImage (no data); appimage = fast standalone AppImage only'
         required: true
-        default: both
+        default: all
         type: choice
         options:
-          - both
+          - all
+          - appimage
           - flatpak
           - tarball
+          - both
       smoke_test:
         description: 'Run the headless (Xvfb) smoke test after the build'
         required: true
@@ -51,11 +53,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  APP_ID: 'com.nichinichisou0607.yosuganosora.hdremake'
   FLATPAK_RUNTIME_VERSION: '25.08'
+  FFMPEG_VERSION: '6.1.2'
 
 jobs:
   build-and-release:
-    name: Build Linux packages (Flatpak & Tarball) and publish
+    name: Build Linux packages (Flatpak, Tarball & AppImage) and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -99,11 +103,12 @@ jobs:
           INPUT_PACKAGE_FORMATS: ${{ inputs.package_formats }}
           INPUT_SMOKE_TEST: ${{ inputs.smoke_test }}
           INPUT_PUBLISH: ${{ inputs.publish }}
+          VAR_DATA_REPO: ${{ vars.DATA_REPOSITORY }}
         run: |
           set -euo pipefail
           publish=true
           mode="${INPUT_MODE:-full}"
-          package_formats="${INPUT_PACKAGE_FORMATS:-both}"
+          package_formats="${INPUT_PACKAGE_FORMATS:-all}"
           smoke_test="${INPUT_SMOKE_TEST:-true}"
           if [[ "$EVENT_NAME" == 'push' && "$GITHUB_REF" == refs/tags/* ]]; then
             release_tag="$REF_NAME"
@@ -126,12 +131,55 @@ jobs:
             echo "Cannot derive a numeric version from tag: $release_tag" >&2
             exit 1
           fi
+
+          build_flatpak=false
+          build_tarball=false
+          build_appimage=false
+          need_data=false
+          if [[ "$mode" == 'full' ]]; then
+            case "$package_formats" in
+              all)
+                build_flatpak=true
+                build_tarball=true
+                build_appimage=true
+                need_data=true
+                ;;
+              both)
+                build_flatpak=true
+                build_tarball=true
+                need_data=true
+                ;;
+              flatpak)
+                build_flatpak=true
+                need_data=true
+                ;;
+              tarball)
+                build_tarball=true
+                need_data=true
+                ;;
+              appimage)
+                build_appimage=true
+                need_data=false
+                ;;
+              *)
+                echo "Unknown package_formats: $package_formats" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          data_repo="${VAR_DATA_REPO:-${GITHUB_REPOSITORY}}"
           {
             echo "tag=$release_tag"
             echo "version-name=$version_name"
             echo "build-number=$((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
             echo "mode=$mode"
             echo "package-formats=$package_formats"
+            echo "build-flatpak=$build_flatpak"
+            echo "build-tarball=$build_tarball"
+            echo "build-appimage=$build_appimage"
+            echo "need-data=$need_data"
+            echo "data-repo=$data_repo"
             echo "smoke-test=$smoke_test"
             echo "prerelease=$is_prerelease"
             echo "publish=$publish"
@@ -144,18 +192,87 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sudo apt-get update
+          # Note: Do NOT install Ubuntu's libav*-dev or libunwind-dev here.
+          # Ubuntu's distro FFmpeg links against 35+ Ubuntu-specific sonames
+          # (libxml2.so.2, libx264.so.164, libx265.so.199, libjxl.so.0.7, etc.)
+          # that do not exist on Arch/Fedora or inside the Flatpak runtime.
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config ccache \
-            lbzip2 p7zip-full flatpak flatpak-builder elfutils \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxinerama-dev libxss-dev libxkbcommon-dev libwayland-dev \
-            wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev \
-            libgles2-mesa-dev libasound2-dev libpulse-dev libdbus-1-dev \
-            libudev-dev libunwind-dev libfontconfig1-dev \
-            libavcodec-dev libavformat-dev libswscale-dev libswresample-dev libavutil-dev
+            build-essential cmake ninja-build pkg-config ccache nasm \
+            lbzip2 p7zip-full flatpak flatpak-builder elfutils patchelf file \
+            desktop-file-utils fonts-wqy-microhei \
+            zlib1g-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxss-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
+            libfontconfig1-dev
+
+      - name: Restore cached self-contained FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/ffmpeg-minimal
+          key: linux-ffmpeg-minimal-v2-${{ env.FFMPEG_VERSION }}
+
+      - name: Build minimal self-contained FFmpeg (zero external codec deps)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          FFMPEG_VER: ${{ env.FFMPEG_VERSION }}
+        run: |
+          set -euo pipefail
+          prefix="$HOME/.local/ffmpeg-minimal"
+          src_dir="$RUNNER_TEMP/ffmpeg-src"
+          rm -rf "$src_dir" "$prefix"
+          mkdir -p "$src_dir" "$prefix"
+
+          curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER}.tar.xz" \
+            | tar -xJ -C "$src_dir" --strip-components=1
+
+          cd "$src_dir"
+          # Disable autodetected host libraries (libxml2, x264, x265, jxl, svtav1,
+          # bluray, gnutls, rsvg, vaapi, etc.) and keep only built-in software
+          # decoders and demuxers so the resulting .so files only depend on glibc/zlib.
+          ./configure \
+            --prefix="$prefix" \
+            --disable-autodetect \
+            --disable-programs \
+            --disable-doc \
+            --disable-network \
+            --disable-encoders \
+            --disable-muxers \
+            --disable-avdevice \
+            --disable-avfilter \
+            --disable-postproc \
+            --disable-hwaccels \
+            --enable-shared \
+            --disable-static \
+            --enable-pic \
+            --enable-zlib \
+            --extra-ldflags="-Wl,--as-needed"
+
+          make -j"$(nproc)"
+          make install
+
+          for so in "$prefix"/lib/lib*.so*; do
+            if [[ -f "$so" && ! -L "$so" ]]; then
+              patchelf --set-rpath '$ORIGIN' "$so"
+            fi
+          done
+
+          rm -rf "$src_dir"
+          ls -lh "$prefix/lib"
+
+      - name: Save cached self-contained FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.local/ffmpeg-minimal
+          key: linux-ffmpeg-minimal-v2-${{ env.FFMPEG_VERSION }}
 
       - name: Set up Flathub Freedesktop Runtime
-        if: steps.release.outputs.mode == 'full' && (steps.release.outputs.package-formats == 'both' || steps.release.outputs.package-formats == 'flatpak')
+        if: steps.release.outputs.build-flatpak == 'true'
         shell: bash
         env:
           RUNTIME_VER: ${{ env.FLATPAK_RUNTIME_VERSION }}
@@ -165,7 +282,7 @@ jobs:
           flatpak install --user -y flathub "org.freedesktop.Platform//$RUNTIME_VER" "org.freedesktop.Sdk//$RUNTIME_VER"
 
       - name: Download the game data from the source release
-        if: steps.release.outputs.mode == 'full'
+        if: steps.release.outputs.need-data == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -176,7 +293,7 @@ jobs:
           python3 tools/fetch_data_parts.py --dest data
 
       - name: Inject the game version into status.tjs
-        if: steps.release.outputs.mode == 'full'
+        if: steps.release.outputs.need-data == 'true'
         shell: bash
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
@@ -187,7 +304,7 @@ jobs:
             --status data/system/Status.tjs
 
       - name: Generate complete content manifest
-        if: steps.release.outputs.mode == 'full'
+        if: steps.release.outputs.need-data == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -201,14 +318,27 @@ jobs:
       - name: Configure and build Linux target (compile-check)
         if: steps.release.outputs.mode == 'compile-check'
         shell: bash
+        env:
+          VERSION_NAME: ${{ steps.release.outputs.version-name }}
+          BUILD_NUMBER: ${{ steps.release.outputs.build-number }}
+          DATA_REPO: ${{ steps.release.outputs.data-repo }}
         run: |
           set -euo pipefail
+          export PKG_CONFIG_PATH="$HOME/.local/ffmpeg-minimal/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           cmake -S . -B build/linux-check -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed" \
+            -DKRKRSDL2_LINUX_APP_ID="${APP_ID}" \
+            -DKRKRSDL2_DEFAULT_DATA_REPO="${DATA_REPO}" \
+            -DKRKRSDL2_VERSION_NAME="${VERSION_NAME}" \
+            -DKRKRSDL2_BUILD_NUMBER="${BUILD_NUMBER}" \
             -DOPTION_BUILD_MACOS_BUNDLE=OFF \
             -DKRKRSDL2_GENERATE_CONTENT_MANIFEST=OFF \
             -DKRKRSDL2_INSTALL_LINUX_DATA=OFF
           cmake --build build/linux-check --target krkrsdl2 --parallel "$(nproc)"
+          mkdir -p build/linux-check/lib
+          cp -a "$HOME/.local/ffmpeg-minimal"/lib/lib*.so* build/linux-check/lib/
+          patchelf --set-rpath '$ORIGIN/lib' build/linux-check/krkrsdl2
           file build/linux-check/krkrsdl2
           ldd build/linux-check/krkrsdl2 | sort
 
@@ -218,25 +348,37 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ccache
-          key: linux-release-ccache-v1-${{ github.sha }}
+          key: linux-release-ccache-v3-${{ github.sha }}
           restore-keys: |
-            linux-release-ccache-v1-
+            linux-release-ccache-v3-
+            linux-release-ccache-v2-
 
       - name: Build native Linux target (full)
         if: steps.release.outputs.mode == 'full'
         shell: bash
+        env:
+          VERSION_NAME: ${{ steps.release.outputs.version-name }}
+          BUILD_NUMBER: ${{ steps.release.outputs.build-number }}
+          DATA_REPO: ${{ steps.release.outputs.data-repo }}
         run: |
           set -euo pipefail
           export CCACHE_DIR="$HOME/.cache/ccache"
+          export PKG_CONFIG_PATH="$HOME/.local/ffmpeg-minimal/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           ccache -z || true
           cmake -S . -B build/linux-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed" \
+            -DKRKRSDL2_LINUX_APP_ID="${APP_ID}" \
+            -DKRKRSDL2_DEFAULT_DATA_REPO="${DATA_REPO}" \
+            -DKRKRSDL2_VERSION_NAME="${VERSION_NAME}" \
+            -DKRKRSDL2_BUILD_NUMBER="${BUILD_NUMBER}" \
             -DOPTION_BUILD_MACOS_BUNDLE=OFF \
             -DKRKRSDL2_GENERATE_CONTENT_MANIFEST=OFF \
             -DKRKRSDL2_INSTALL_LINUX_DATA=OFF
           cmake --build build/linux-release --target krkrsdl2 --parallel "$(nproc)"
+          patchelf --set-rpath '$ORIGIN/lib' build/linux-release/krkrsdl2
           ccache -s || true
           file build/linux-release/krkrsdl2
 
@@ -246,12 +388,187 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/ccache
-          key: linux-release-ccache-v1-${{ github.sha }}
+          key: linux-release-ccache-v3-${{ github.sha }}
+
+      - name: Package data-external standalone AppImage (.AppImage)
+        if: steps.release.outputs.build-appimage == 'true'
+        id: pkg-appimage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          DATA_REPO: ${{ steps.release.outputs.data-repo }}
+        run: |
+          set -euo pipefail
+          asset_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$asset_dir"
+          arch="$(uname -m)"
+          app_id="${APP_ID}"
+          appdir="$RUNNER_TEMP/AppDir"
+          rm -rf "$appdir"
+          mkdir -p \
+            "$appdir/usr/bin" \
+            "$appdir/usr/lib" \
+            "$appdir/usr/share/yosuganosora/bootstrap" \
+            "$appdir/usr/share/applications" \
+            "$appdir/usr/share/metainfo"
+
+          cp build/linux-release/krkrsdl2 "$appdir/usr/bin/krkrsdl2"
+          patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/lib' "$appdir/usr/bin/krkrsdl2"
+          cp -a "$HOME/.local/ffmpeg-minimal"/lib/lib*.so* "$appdir/usr/lib/"
+
+          echo "=== Auditing shared library resolution for AppImage ==="
+          ldd "$appdir/usr/bin/krkrsdl2"
+          if ldd "$appdir/usr/bin/krkrsdl2" | grep -q 'not found'; then
+            echo "::error::Unresolved shared library in AppImage krkrsdl2"
+            exit 1
+          fi
+          for so in "$appdir"/usr/lib/lib*.so*; do
+            if [[ -f "$so" && ! -L "$so" ]]; then
+              if ldd "$so" | grep -q 'not found'; then
+                echo "::error::Unresolved shared library in $so"
+                ldd "$so"
+                exit 1
+              fi
+              if ldd "$so" | grep -E 'libxml2|libx264|libx265|libjxl|libsvtav1|libbluray|librsvg|libgnutls'; then
+                echo "::error::Bundled library $so leaked host distro dependencies!"
+                exit 1
+              fi
+            fi
+          done
+
+          # Bundle the project's built-in bootstrap UI artwork (same 1920x1080
+          # assets used by iOS / Android / OpenHarmony) + CJK fallback font.
+          boot_dir="$appdir/usr/share/yosuganosora/bootstrap"
+          for art in \
+            Background.png \
+            github_direct.png github_direct_selected.png \
+            gh_proxy_label.png gh_proxy_label_selected.png \
+            craft_hello_label.png craft_hello_label_selected.png \
+            progress_track.png \
+            download_label.png download_label_active.png \
+            import_label.png import_label_active.png; do
+            cp "src/resources/ios/$art" "$boot_dir/$art"
+          done
+
+          if [[ -f /usr/share/fonts/truetype/wqy/wqy-microhei.ttc ]]; then
+            cp /usr/share/fonts/truetype/wqy/wqy-microhei.ttc "$boot_dir/fallback.ttc"
+          fi
+
+          # Inject default-manifest.json pointing to the newest data-vN release
+          # (same convention as release-ios.yml / release-android.yml / release-ohos.yml).
+          data_tag="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${DATA_REPO}/releases?per_page=100" 2>/dev/null \
+            | python3 -c '
+          import json, re, sys
+          try:
+              rels = json.load(sys.stdin)
+          except Exception:
+              rels = []
+          best_tag, best_n = "", -1
+          for r in rels:
+              if r.get("draft"):
+                  continue
+              m = re.match(r"^data-v(\d+)$", str(r.get("tag_name", "")))
+              if m and int(m.group(1)) > best_n:
+                  best_n = int(m.group(1))
+                  best_tag = r["tag_name"]
+          print(best_tag)
+          ' || true
+          )"
+          if [[ -n "$data_tag" ]]; then
+            base_url="https://github.com/${DATA_REPO}/releases/download/${data_tag}/"
+          else
+            base_url="https://github.com/${DATA_REPO}/releases/latest/download/"
+          fi
+          printf '{"baseUrl":"%s","releaseTag":"%s"}\n' "$base_url" "$RELEASE_TAG" \
+            > "$boot_dir/default-manifest.json"
+          echo "Injected default-manifest.json:"
+          cat "$boot_dir/default-manifest.json"
+
+          # Icons (root + hicolor + bootstrap window icon)
+          for sz in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+            src_ic="src/resources/linux/icons/hicolor/$sz/apps/yosuganosora.png"
+            if [[ -f "$src_ic" ]]; then
+              install -Dm644 "$src_ic" "$appdir/usr/share/icons/hicolor/$sz/apps/$app_id.png"
+            fi
+          done
+          icon256="src/resources/linux/icons/hicolor/256x256/apps/yosuganosora.png"
+          cp "$icon256" "$boot_dir/icon.png"
+          cp "$icon256" "$appdir/$app_id.png"
+          ln -sfn "$app_id.png" "$appdir/.DirIcon"
+
+          cat << EOF > "$appdir/$app_id.desktop"
+          [Desktop Entry]
+          Type=Application
+          Name=Yosuga no Sora: HD Remake
+          Name[zh_CN]=缘之空：高清重制
+          Name[zh_TW]=緣之空：高清重製
+          Name[ja]=ヨスガノソラ HDリメイク
+          Comment=Yosuga no Sora: HD Remake (Data-External AppImage)
+          Comment[zh_CN]=《缘之空：高清重制》（独立引导版，首次运行可在线下载或导入数据包）
+          Exec=krkrsdl2 %F
+          Icon=$app_id
+          Terminal=false
+          Categories=Game;AdventureGame;
+          StartupWMClass=$app_id
+          EOF
+          cp "$appdir/$app_id.desktop" "$appdir/usr/share/applications/$app_id.desktop"
+
+          cat << EOF > "$appdir/usr/share/metainfo/$app_id.metainfo.xml"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>$app_id</id>
+            <metadata_license>CC0-1.0</metadata_license>
+            <project_license>Proprietary</project_license>
+            <name>Yosuga no Sora: HD Remake</name>
+            <summary>Yosuga no Sora HD Remake for Linux</summary>
+            <description>
+              <p>Yosuga no Sora HD Remake for Linux (standalone AppImage with built-in data bootstrap).</p>
+            </description>
+            <launchable type="desktop-id">$app_id.desktop</launchable>
+          </component>
+          EOF
+
+          cat << EOF > "$appdir/AppRun"
+          #!/bin/sh
+          HERE="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+          export LD_LIBRARY_PATH="\$HERE/usr/lib:\${LD_LIBRARY_PATH:-}"
+          export KRKR_LINUX_BOOTSTRAP_ASSETS="\$HERE/usr/share/yosuganosora/bootstrap"
+          export SDL_VIDEO_X11_WMCLASS="$app_id"
+          export SDL_VIDEO_WAYLAND_WMCLASS="$app_id"
+          exec "\$HERE/usr/bin/krkrsdl2" "\$@"
+          EOF
+          chmod +x "$appdir/AppRun"
+
+          appimagetool="$RUNNER_TEMP/appimagetool-$arch.AppImage"
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 -o "$appimagetool" \
+              "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${arch}.AppImage"; then
+              break
+            fi
+            sleep $((attempt * 3))
+          done
+          chmod +x "$appimagetool"
+
+          appimage_name="Yosuga-no-Sora-HD-Remake-Linux-$arch-$RELEASE_TAG.AppImage"
+          ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$appimagetool" --no-appstream "$appdir" "$asset_dir/$appimage_name"
+          chmod +x "$asset_dir/$appimage_name"
+          rm -rf "$appdir"
+          ls -lh "$asset_dir/$appimage_name"
+          echo "appimage-path=$asset_dir/$appimage_name" >> "$GITHUB_OUTPUT"
 
       - name: Headless smoke test
         if: steps.release.outputs.mode == 'full' && steps.release.outputs.smoke-test == 'true'
         continue-on-error: true
         shell: bash
+        env:
+          NEED_DATA: ${{ steps.release.outputs.need-data }}
+          APPIMAGE_PATH: ${{ steps.pkg-appimage.outputs.appimage-path }}
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends \
@@ -268,32 +585,57 @@ jobs:
           shot="$RUNNER_TEMP/game-smoke-shot.png"
           log="$RUNNER_TEMP/game-smoke-run.log"
           diag="$RUNNER_TEMP/game-smoke-diag.txt"
-          rm -f "$shot" "$diag"
+          rm -f "$shot" "$diag" "$log"
 
-          smoke_dir="$RUNNER_TEMP/smoke-run"
-          mkdir -p "$smoke_dir"
-          cp build/linux-release/krkrsdl2 "$smoke_dir/"
-          ln -sfn "$GITHUB_WORKSPACE/data" "$smoke_dir/data"
-          ln -sfn "$GITHUB_WORKSPACE/data" build/linux-release/data
+          if [[ "$NEED_DATA" == 'true' ]]; then
+            smoke_dir="$RUNNER_TEMP/smoke-run"
+            mkdir -p "$smoke_dir/lib"
+            cp build/linux-release/krkrsdl2 "$smoke_dir/"
+            cp -a "$HOME/.local/ffmpeg-minimal"/lib/lib*.so* "$smoke_dir/lib/"
+            ln -sfn "$GITHUB_WORKSPACE/data" "$smoke_dir/data"
 
-          (
-            sleep 25
-            {
-              echo "=== xwininfo -root -tree ==="
-              xwininfo -root -tree 2>&1 || true
-              echo "=== xlsclients ==="
-              xlsclients -l 2>&1 | head -n 40 || true
-            } > "$diag" 2>&1
-            import -window root "$shot" 2>/dev/null || true
-          ) &
+            (
+              sleep 25
+              {
+                echo "=== xwininfo -root -tree ==="
+                xwininfo -root -tree 2>&1 || true
+                echo "=== xlsclients ==="
+                xlsclients -l 2>&1 | head -n 40 || true
+              } > "$diag" 2>&1
+              import -window root "$shot" 2>/dev/null || true
+            ) &
 
-          set +e
-          cd "$smoke_dir"
-          timeout --signal=TERM --kill-after=20 60 ./krkrsdl2 > "$log" 2>&1
-          status=$?
-          set -e
-          echo "--- Smoke test exit status: $status ---"
-          cat "$log" || true
+            set +e
+            cd "$smoke_dir"
+            timeout --signal=TERM --kill-after=20 60 ./krkrsdl2 > "$log" 2>&1
+            status=$?
+            set -e
+            echo "--- Game smoke test exit status: $status ---"
+          elif [[ -n "$APPIMAGE_PATH" && -x "$APPIMAGE_PATH" ]]; then
+            # AppImage-only build (no 4 GB data downloaded): smoke-test the
+            # built-in native Bootstrap UI inside Xvfb!
+            export KRKR_LINUX_DATA_DIR="$RUNNER_TEMP/smoke-empty-xdg"
+            rm -rf "$KRKR_LINUX_DATA_DIR"
+            mkdir -p "$KRKR_LINUX_DATA_DIR"
+
+            (
+              sleep 6
+              {
+                echo "=== xwininfo -root -tree ==="
+                xwininfo -root -tree 2>&1 || true
+              } > "$diag" 2>&1
+              import -window root "$shot" 2>/dev/null || true
+            ) &
+
+            set +e
+            APPIMAGE_EXTRACT_AND_RUN=1 timeout --signal=TERM --kill-after=5 10 \
+              "$APPIMAGE_PATH" > "$log" 2>&1
+            status=$?
+            set -e
+            echo "--- AppImage Bootstrap UI smoke test exit status: $status ---"
+          fi
+
+          cat "$log" 2>/dev/null || true
           cat "$diag" 2>/dev/null || true
           ls -l "$shot" 2>/dev/null || echo "no screenshot was captured"
 
@@ -313,25 +655,39 @@ jobs:
       - name: Verify smoke test results
         if: steps.release.outputs.mode == 'full' && steps.release.outputs.smoke-test == 'true'
         shell: bash
+        env:
+          NEED_DATA: ${{ steps.release.outputs.need-data }}
         run: |
           set +e
           log="$RUNNER_TEMP/game-smoke-run.log"
           shot="$RUNNER_TEMP/game-smoke-shot.png"
+          diag="$RUNNER_TEMP/game-smoke-diag.txt"
           fail=0
-          if ! grep -q 'VIDSOFTBLIT .*result=0' "$log"; then
-            echo "::error::Engine failed to present a frame"
-            grep -E 'VIDREACH|VIDSOFTBLIT|VIDTICK' "$log" | head -n 10 || true
-            fail=1
-          fi
 
-          raw_frames="$(grep -c 'LYRIMGCHG' "$log" 2>/dev/null || true)"
-          frames="$(echo "$raw_frames" | tr -dc '0-9')"
-          frames="${frames:-0}"
-          if [[ "$frames" -lt 3 ]]; then
-            echo "::error::Engine reported fewer than 3 layer updates ($frames)"
-            fail=1
+          if [[ "$NEED_DATA" == 'true' ]]; then
+            if ! grep -q 'VIDSOFTBLIT .*result=0' "$log"; then
+              echo "::error::Engine failed to present a frame"
+              grep -E 'VIDREACH|VIDSOFTBLIT|VIDTICK' "$log" | head -n 10 || true
+              fail=1
+            fi
+
+            raw_frames="$(grep -c 'LYRIMGCHG' "$log" 2>/dev/null || true)"
+            frames="$(echo "$raw_frames" | tr -dc '0-9')"
+            frames="${frames:-0}"
+            if [[ "$frames" -lt 3 ]]; then
+              echo "::error::Engine reported fewer than 3 layer updates ($frames)"
+              fail=1
+            fi
+            echo "Engine layer updates: $frames"
+          else
+            # Verify the standalone AppImage opened its Bootstrap SDL window cleanly
+            if ! grep -Eq '1280x720|1600x900' "$diag" 2>/dev/null; then
+              echo "::error::AppImage Bootstrap window was not detected in Xvfb"
+              fail=1
+            else
+              echo "AppImage Bootstrap UI window rendered cleanly under Xvfb."
+            fi
           fi
-          echo "Engine layer updates: $frames"
 
           if [[ -f "$shot" ]]; then
             python3 tools/check_smoke_screenshot.py "$shot" 2>&1 || true
@@ -339,7 +695,7 @@ jobs:
           exit "$fail"
 
       - name: Package standard .tar.bz2 distribution
-        if: steps.release.outputs.mode == 'full' && (steps.release.outputs.package-formats == 'both' || steps.release.outputs.package-formats == 'tarball')
+        if: steps.release.outputs.build-tarball == 'true'
         id: pkg-tarball
         shell: bash
         env:
@@ -349,6 +705,7 @@ jobs:
           asset_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$asset_dir"
           arch="$(uname -m)"
+          app_id="${APP_ID}"
           dir_name="Yosuga-no-Sora-HD-Remake-Linux-$arch-$RELEASE_TAG"
           stage_dir="$RUNNER_TEMP/stage-tarball/$dir_name"
           mkdir -p "$stage_dir/lib"
@@ -356,9 +713,28 @@ jobs:
           cp build/linux-release/krkrsdl2 "$stage_dir/"
           cp -r data "$stage_dir/"
 
-          # Bundle FFmpeg runtime libraries to guarantee compatibility across diverse Linux distributions
-          for lib in libavformat libavcodec libswscale libswresample libavutil; do
-            cp -a /usr/lib/x86_64-linux-gnu/${lib}.so* "$stage_dir/lib/" 2>/dev/null || true
+          # Bundle our self-contained FFmpeg runtime libraries (no libxml2/x264/x265/jxl deps)
+          cp -a "$HOME/.local/ffmpeg-minimal"/lib/lib*.so* "$stage_dir/lib/"
+
+          echo "=== Auditing shared library resolution for tarball ==="
+          ldd "$stage_dir/krkrsdl2"
+          if ldd "$stage_dir/krkrsdl2" | grep -q 'not found'; then
+            echo "::error::Unresolved shared library in krkrsdl2"
+            exit 1
+          fi
+          for so in "$stage_dir"/lib/lib*.so*; do
+            if [[ -f "$so" && ! -L "$so" ]]; then
+              echo "--- ldd $(basename "$so") ---"
+              ldd "$so"
+              if ldd "$so" | grep -q 'not found'; then
+                echo "::error::Unresolved shared library in $so"
+                exit 1
+              fi
+              if ldd "$so" | grep -E 'libxml2|libx264|libx265|libjxl|libsvtav1|libbluray|librsvg|libgnutls'; then
+                echo "::error::Bundled library $so leaked host distro dependencies!"
+                exit 1
+              fi
+            fi
           done
 
           icon="src/resources/linux/icons/hicolor/256x256/apps/yosuganosora.png"
@@ -366,25 +742,31 @@ jobs:
             cp "$icon" "$stage_dir/yosuganosora.png"
           fi
 
-          cat << 'EOF' > "$stage_dir/start.sh"
+          cat << EOF > "$stage_dir/start.sh"
           #!/usr/bin/env bash
           set -euo pipefail
-          SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-          export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:${LD_LIBRARY_PATH:-}"
-          cd "$SCRIPT_DIR"
-          exec ./krkrsdl2 "$@"
+          SCRIPT_DIR="\$(cd "\$(dirname "\$(readlink -f "\${BASH_SOURCE[0]}")")" && pwd)"
+          export LD_LIBRARY_PATH="\$SCRIPT_DIR/lib:\${LD_LIBRARY_PATH:-}"
+          export SDL_VIDEO_X11_WMCLASS="$app_id"
+          export SDL_VIDEO_WAYLAND_WMCLASS="$app_id"
+          cd "\$SCRIPT_DIR"
+          exec ./krkrsdl2 "\$@"
           EOF
           chmod +x "$stage_dir/start.sh"
 
-          cat << 'EOF' > "$stage_dir/yosuganosora.desktop"
+          cat << EOF > "$stage_dir/yosuganosora.desktop"
           [Desktop Entry]
           Type=Application
           Name=Yosuga no Sora: HD Remake
+          Name[zh_CN]=缘之空：高清重制
+          Name[zh_TW]=緣之空：高清重製
+          Name[ja]=ヨスガノソラ HDリメイク
           Comment=Yosuga no Sora: HD Remake
           Exec=./start.sh
           Icon=yosuganosora
           Terminal=false
           Categories=Game;AdventureGame;
+          StartupWMClass=$app_id
           EOF
 
           echo "Compressing into $dir_name.tar.bz2 via lbzip2..."
@@ -393,7 +775,7 @@ jobs:
           ls -lh "$asset_dir/$dir_name.tar.bz2"
 
       - name: Package Flatpak application bundle (.flatpak)
-        if: steps.release.outputs.mode == 'full' && (steps.release.outputs.package-formats == 'both' || steps.release.outputs.package-formats == 'flatpak')
+        if: steps.release.outputs.build-flatpak == 'true'
         id: pkg-flatpak
         shell: bash
         env:
@@ -404,54 +786,78 @@ jobs:
           asset_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$asset_dir"
           arch="$(uname -m)"
-          app_id="com.nichinichisou0607.yosuganosora.hdremake"
+          app_id="${APP_ID}"
           flatpak_work="$RUNNER_TEMP/flatpak-work"
-          mkdir -p "$flatpak_work/staged/lib"
+          rm -rf "$flatpak_work"
+          mkdir -p "$flatpak_work/staged/lib" "$flatpak_work/staged/icons"
 
           cp build/linux-release/krkrsdl2 "$flatpak_work/staged/"
+          patchelf --set-rpath '/app/lib:$ORIGIN/lib' "$flatpak_work/staged/krkrsdl2"
           cp -r data "$flatpak_work/staged/"
 
-          # Bundle FFmpeg runtime libraries to prevent soname version mismatch with the Flatpak runtime
-          for lib in libavformat libavcodec libswscale libswresample libavutil; do
-            cp -a /usr/lib/x86_64-linux-gnu/${lib}.so* "$flatpak_work/staged/lib/" 2>/dev/null || true
-          done
+          # Bundle our self-contained FFmpeg runtime libraries
+          cp -a "$HOME/.local/ffmpeg-minimal"/lib/lib*.so* "$flatpak_work/staged/lib/"
 
-          cat << 'EOF' > "$flatpak_work/staged/yosuganosora"
+          # Fixed Flatpak launcher:
+          # - Explicitly passes /app/share/yosuganosora/data as the project dir
+          #   argument when no custom path is passed (SDL_GetBasePath() is /app/bin/,
+          #   and SysInitImpl's getcwd() fallback does NOT append /data, which
+          #   previously caused "Cannot find storage startup.tjs").
+          # - Stores save data cleanly in ~/.var/app/<app_id>/data/savedata/.
+          # - Sets X11/Wayland WMClass to match <app_id>.desktop for proper icons.
+          cat << EOF > "$flatpak_work/staged/yosuganosora"
           #!/bin/sh
-          export LD_LIBRARY_PATH="/app/lib:${LD_LIBRARY_PATH:-}"
-          USER_GAME_DIR="${XDG_DATA_HOME:-$HOME/.var/app/com.nichinichisou0607.yosuganosora.hdremake/data}/yosuganosora"
-          mkdir -p "$USER_GAME_DIR"
-          if [ ! -e "$USER_GAME_DIR/data" ]; then
-            ln -s /app/share/yosuganosora/data "$USER_GAME_DIR/data"
+          export LD_LIBRARY_PATH="/app/lib:\${LD_LIBRARY_PATH:-}"
+          export KRKR_LINUX_SAVE_DIR="\${KRKR_LINUX_SAVE_DIR:-\${XDG_DATA_HOME:-\$HOME/.var/app/$app_id/data}/savedata}"
+          export SDL_VIDEO_X11_WMCLASS="$app_id"
+          export SDL_VIDEO_WAYLAND_WMCLASS="$app_id"
+          mkdir -p "\$KRKR_LINUX_SAVE_DIR"
+          has_path=0
+          for arg in "\$@"; do
+            case "\$arg" in
+              --) break ;;
+              -*) ;;
+              *) has_path=1; break ;;
+            esac
+          done
+          if [ "\$has_path" -eq 0 ]; then
+            exec /app/bin/krkrsdl2 /app/share/yosuganosora/data "\$@"
+          else
+            exec /app/bin/krkrsdl2 "\$@"
           fi
-          cd "$USER_GAME_DIR"
-          exec /app/bin/krkrsdl2 "$@"
           EOF
           chmod +x "$flatpak_work/staged/yosuganosora"
 
-          icon="src/resources/linux/icons/hicolor/256x256/apps/yosuganosora.png"
-          if [[ -f "$icon" ]]; then
-            cp "$icon" "$flatpak_work/staged/$app_id.png"
-          fi
+          for sz in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+            src_ic="src/resources/linux/icons/hicolor/$sz/apps/yosuganosora.png"
+            if [[ -f "$src_ic" ]]; then
+              install -Dm644 "$src_ic" "$flatpak_work/staged/icons/$sz/apps/$app_id.png"
+            fi
+          done
 
           cat << EOF > "$flatpak_work/staged/$app_id.desktop"
           [Desktop Entry]
           Type=Application
           Name=Yosuga no Sora: HD Remake
+          Name[zh_CN]=缘之空：高清重制
+          Name[zh_TW]=緣之空：高清重製
+          Name[ja]=ヨスガノソラ HDリメイク
           Comment=Yosuga no Sora: HD Remake
+          Comment[zh_CN]=基于 Kirikiri SDL2 引擎的《缘之空》高清重制版
           Exec=yosuganosora
           Icon=$app_id
           Terminal=false
           Categories=Game;AdventureGame;
+          StartupWMClass=$app_id
           EOF
 
           cat << EOF > "$flatpak_work/staged/$app_id.metainfo.xml"
           <?xml version="1.0" encoding="UTF-8"?>
           <component type="desktop-application">
             <id>$app_id</id>
-            <metadata_license>Proprietary</metadata_license>
-            <project_license>MIT License & Proprietary</project_license>
-            <name>Yosuga no Sora HD Remake</name>
+            <metadata_license>CC0-1.0</metadata_license>
+            <project_license>Proprietary</project_license>
+            <name>Yosuga no Sora: HD Remake</name>
             <summary>Yosuga no Sora HD Remake for Linux</summary>
             <description>
               <p>Yosuga no Sora HD Remake for Linux.</p>
@@ -463,6 +869,13 @@ jobs:
           </component>
           EOF
 
+          # Note on finish-args:
+          # - --socket=x11 + --socket=wayland: unlike --socket=fallback-x11 (which
+          #   hides DISPLAY on Wayland sessions and forces SDL2 off XWayland onto
+          #   wl_shm/libdecor where GNOME Mutter lacks server-side titlebars),
+          #   exposing both x11 and wayland matches the working Tarball behavior
+          #   while still supporting pure-Wayland sessions.
+          # - --device=all: exposes /dev/dri (GPU) AND /dev/input (controllers).
           cat << EOF > "$flatpak_work/$app_id.yaml"
           app-id: $app_id
           runtime: org.freedesktop.Platform
@@ -475,10 +888,10 @@ jobs:
             strip: false
           finish-args:
             - --share=ipc
-            - --socket=fallback-x11
+            - --socket=x11
             - --socket=wayland
             - --socket=pulseaudio
-            - --device=dri
+            - --device=all
           modules:
             - name: yosuganosora
               buildsystem: simple
@@ -490,7 +903,8 @@ jobs:
                 - mkdir -p /app/share/yosuganosora
                 - cp -r data /app/share/yosuganosora/
                 - install -Dm644 $app_id.desktop /app/share/applications/$app_id.desktop
-                - test -f $app_id.png && install -Dm644 $app_id.png /app/share/icons/hicolor/256x256/apps/$app_id.png || true
+                - mkdir -p /app/share/icons/hicolor
+                - cp -a icons/. /app/share/icons/hicolor/
                 - install -Dm644 $app_id.metainfo.xml /app/share/metainfo/$app_id.metainfo.xml
               sources:
                 - type: dir
@@ -501,6 +915,27 @@ jobs:
             --repo="$flatpak_work/repo" \
             "$flatpak_work/build-dir" \
             "$flatpak_work/$app_id.yaml"
+
+          echo "=== Auditing shared libraries & data inside Flatpak runtime ($RUNTIME_VER) ==="
+          flatpak build "$flatpak_work/build-dir" sh -ceu '
+            export LD_LIBRARY_PATH=/app/lib
+            ldd /app/bin/krkrsdl2
+            if ldd /app/bin/krkrsdl2 | grep -q "not found"; then
+              echo "ERROR: Unresolved shared library in /app/bin/krkrsdl2 inside Flatpak!" >&2
+              exit 1
+            fi
+            for so in /app/lib/lib*.so*; do
+              if [ -f "$so" ] && [ ! -L "$so" ]; then
+                if ldd "$so" | grep -q "not found"; then
+                  echo "ERROR: Unresolved shared library in $so inside Flatpak!" >&2
+                  ldd "$so" >&2
+                  exit 1
+                fi
+              fi
+            done
+            test -f /app/share/yosuganosora/data/startup.tjs
+            echo "Verified /app/share/yosuganosora/data/startup.tjs inside Flatpak sandbox."
+          '
 
           bundle_name="Yosuga-no-Sora-HD-Remake-Linux-$arch-$RELEASE_TAG.flatpak"
           flatpak build-bundle --arch="$arch" \
@@ -523,7 +958,7 @@ jobs:
           asset_dir="$RUNNER_TEMP/release-assets"
           cd "$asset_dir"
           shopt -s nullglob
-          payloads=( *.tar.bz2 *.flatpak )
+          payloads=( *.tar.bz2 *.flatpak *.AppImage )
           if [[ "${#payloads[@]}" -eq 0 ]]; then
             echo "Error: No release assets produced." >&2
             exit 1
@@ -548,19 +983,28 @@ jobs:
             echo 'Platform: Linux (x86_64)'
             echo "Release: $RELEASE_TAG"
             echo "Commit: $GITHUB_SHA"
+            echo "App ID: $APP_ID"
             echo "Flatpak Runtime: org.freedesktop.Platform//$RUNTIME_VER"
             echo
-            echo 'Installation Instructions:'
-            echo '=========================='
-            echo '1. Flatpak package (.flatpak):'
-            echo '   - If single file: flatpak install ./Yosuga-no-Sora-*.flatpak'
-            echo '   - If split (.7z.NNN): extract with 7-Zip or p7zip first, then run flatpak install'
-            echo '   - Run with: flatpak run com.nichinichisou0607.yosuganosora.hdremake'
+            echo 'Package Variants & Usage:'
+            echo '========================='
+            echo '1. Standalone AppImage (.AppImage, data-external ~20 MB):'
+            echo '   - chmod +x ./Yosuga-no-Sora-*.AppImage && ./Yosuga-no-Sora-*.AppImage'
+            echo '   - Uses the built-in bootstrap UI on first launch to download game data'
+            echo '     (GitHub Direct / gh-proxy / craft-hello / custom URL) or import local'
+            echo '     data-part*.zip / data.xp3 into ~/.local/share/'"$APP_ID"'/data/'
+            echo '   - Portable mode: place data/ or data.xp3 in the same directory as the .AppImage'
             echo
-            echo '2. Standard Tarball (.tar.bz2):'
-            echo '   - If single file: tar -xjf ./Yosuga-no-Sora-*.tar.bz2'
-            echo '   - If split (.7z.NNN): extract with 7-Zip, then unpack the .tar.bz2'
-            echo '   - Run with: ./start.sh'
+            echo '2. Flatpak Bundle (.flatpak, full game data embedded):'
+            echo '   - If split (.7z.NNN): extract with 7z x *.flatpak.7z.001 first'
+            echo '   - Install: flatpak install --user ./Yosuga-no-Sora-*.flatpak'
+            echo "   - Run:     flatpak run $APP_ID"
+            echo "   - Saves:   ~/.var/app/$APP_ID/data/savedata/"
+            echo
+            echo '3. Standard Tarball (.tar.bz2, full game data embedded):'
+            echo '   - If split (.7z.NNN): extract with 7z x *.tar.bz2.7z.001 first'
+            echo '   - Unpack:  tar -xjf ./Yosuga-no-Sora-*.tar.bz2'
+            echo '   - Run:     ./start.sh (or ./krkrsdl2)'
             echo
             echo 'SHA-256 Checksums:'
             echo '=================='
