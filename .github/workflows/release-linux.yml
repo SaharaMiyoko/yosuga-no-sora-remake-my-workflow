@@ -855,7 +855,7 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <component type="desktop-application">
             <id>$app_id</id>
-            <metadata_license>CC0-1.0</metadata_license>
+            <metadata_license>Proprietary</metadata_license>
             <project_license>Proprietary</project_license>
             <name>Yosuga no Sora: HD Remake</name>
             <summary>Yosuga no Sora HD Remake for Linux</summary>
