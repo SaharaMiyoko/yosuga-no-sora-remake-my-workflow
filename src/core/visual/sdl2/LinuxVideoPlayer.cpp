@@ -113,8 +113,14 @@ bool TVPLinuxVideoPlayer::Open(const char *filename)
 		return false;
 	}
 	video_ctx_ = avcodec_alloc_context3(video_codec);
-	if (!video_ctx_ || avcodec_parameters_to_context(video_ctx_, video_params) < 0 ||
-		avcodec_open2(video_ctx_, video_codec, nullptr) < 0)
+	if (!video_ctx_ || avcodec_parameters_to_context(video_ctx_, video_params) < 0)
+	{
+		Close();
+		return false;
+	}
+	video_ctx_->thread_count = 0;
+	video_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+	if (avcodec_open2(video_ctx_, video_codec, nullptr) < 0)
 	{
 		Close();
 		return false;
