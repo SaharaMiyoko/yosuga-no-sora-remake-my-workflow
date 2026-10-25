@@ -307,7 +307,22 @@ list(APPEND KRKRSDL2_CFLAGS
 )
 list(APPEND KRKRSDL2_LIBS
 	pthread
+	${CMAKE_DL_LIBS}
 )
+
+list(APPEND KRKRSDL2COMMON_SRC
+	src/core/sdl2/linux/LinuxBootstrap.cpp
+	src/core/sdl2/zip_extract.cpp
+	src/core/sdl2/xp3_extract.cpp
+)
+if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0")
+set_source_files_properties(
+	src/core/sdl2/linux/LinuxBootstrap.cpp
+	src/core/sdl2/zip_extract.cpp
+	src/core/sdl2/xp3_extract.cpp
+	PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+)
+endif()
 
 # Software movie playback. Linux has no native video overlay, so
 # src/core/visual/sdl2/LinuxVideoPlayer.cpp decodes with FFmpeg and the SDL
@@ -332,9 +347,11 @@ list(APPEND KRKRSDL2_LIBS
 set(KRKRSDL2_LINUX_APP_ID "com.shuimo0413.yosuganosora.hdremake" CACHE STRING "Reverse-DNS application id of the Linux build.")
 set(KRKRSDL2_ICON_NAME "yosuganosora" CACHE STRING "hicolor icon basename installed for the Linux desktop integration.")
 set(KRKRSDL2_LINUX_DATA_SUBDIR "share/yosuga-no-sora-remake" CACHE STRING "Prefix-relative directory that receives the game data on Linux.")
+set(KRKRSDL2_DEFAULT_DATA_REPO "SaharaMiyoko/yosuga-no-sora-remake-my-workflow" CACHE STRING "Default GitHub owner/repo used by the Linux bootstrap UI to locate data-vN releases.")
 option(KRKRSDL2_INSTALL_LINUX_DATA "Install the game data alongside the Linux build (required by the linglong package)." ON)
 list(APPEND KRKRSDL2_DEFINITIONS
 	KRKRSDL2_LINUX_APP_ID="${KRKRSDL2_LINUX_APP_ID}"
+	KRKRSDL2_DEFAULT_DATA_REPO="${KRKRSDL2_DEFAULT_DATA_REPO}"
 )
 endif()
 
