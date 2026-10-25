@@ -27,6 +27,9 @@
 #if defined(__IPHONEOS__)
 #include "../../sdl2/ios/IOSBootstrap.h"
 #endif
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+#include "../../sdl2/linux/LinuxBootstrap.h"
+#endif
 #include "MsgIntf.h"
 #include "GraphicsLoaderIntf.h"
 #include "SystemControl.h"
@@ -1201,7 +1204,7 @@ void TVPBeforeSystemInit()
 #elif defined(__vita__)
 		TVPTotalPhysMemory = _newlib_heap_size_user;
 #else
-		TVPTotalPhysMemory = SDL_GetSystemRAM() * 1024 * 1024;
+		TVPTotalPhysMemory = (tjs_uint64)SDL_GetSystemRAM() * 1024ULL * 1024ULL;
 #endif
 #if 0
 		TVPTotalPhysMemory = status.ullTotalPhys;
@@ -1486,6 +1489,23 @@ void TVPBeforeSystemInit()
 		if (iosRoot && iosRoot[0])
 		{
 			std::string root_dir = std::string(iosRoot) + "/";
+			tjs_string root_utf16;
+			if (TVPUtf8ToUtf16(root_utf16, root_dir))
+				base_path_utf16 = root_utf16;
+		}
+	}
+#endif
+#if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
+	// Linux external data flow (e.g. standalone AppImage): when the bootstrap
+	// flow resolved or downloaded an external data root (XDG data dir or
+	// AppImage sibling dir), use it as the search base. Bundled builds and
+	// explicit CLI path invocations leave krkrsdl2_linux_data_root() NULL so
+	// SDL_GetBasePath() / _wargv selection stays unchanged.
+	{
+		const char *linuxRoot = krkrsdl2_linux_data_root();
+		if (linuxRoot && linuxRoot[0])
+		{
+			std::string root_dir = std::string(linuxRoot) + "/";
 			tjs_string root_utf16;
 			if (TVPUtf8ToUtf16(root_utf16, root_dir))
 				base_path_utf16 = root_utf16;
